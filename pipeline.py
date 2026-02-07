@@ -87,16 +87,19 @@ def extract_pdf_text_layer(file_path: str) -> Tuple[str, float]:
     return text, max(0.0, min(1.0, quality))
 
 # ==============================
-# 0) SECURITY: API KEY HANDLING
+# 0) SECURITY: BRUTE FORCE (TEMPORARY)
 # ==============================
-API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-# Fallback for local testing if env var is not set (Paste key here if needed)
-if not API_KEY:
-    # API_KEY = "PASTE_YOUR_KEY_HERE" 
-    pass
+# PASTE YOUR REAL KEY INSIDE THE QUOTES BELOW
+API_KEY = "AIzaSyDVuyyOuPkfCN_RzXWJ_AXLonk0OsTlb6w" 
 
-if not API_KEY:
-    raise RuntimeError("Missing GEMINI_API_KEY environment variable.")
+from google import genai
+# ... rest of imports ...
+
+def get_client():
+    return genai.Client(api_key=API_KEY)
+# 3. If STILL not found, don't crash yet! 
+# We will handle the error when we try to use the client, 
+# allowing the UI to load so the user can enter a key manually.
 
 # ---- DEBUG / COST VISIBILITY ----
 LLM_STATS = {
@@ -494,4 +497,5 @@ if __name__ == "__main__":
         else:
             print("❌ Phase 2 Failed.")
     else:
+
         print("❌ Phase 1 Failed.")
