@@ -18,7 +18,7 @@ from google.genai import types
 # 0) API & CLIENT SETUP
 # ==============================
 # PASTE YOUR REAL KEY INSIDE THE QUOTES BELOW
-API_KEY = "AIzaSyApRagBjknc_BWQttCKZyJjgM_ls1BMJYo"
+API_KEY = "AIzaSyBbW4eA5vTAk2Y7izLxKa_bcOdpCAwaB4o"
 
 def get_client():
     return genai.Client(api_key=API_KEY)
@@ -432,3 +432,4 @@ if __name__ == "__main__":
     else:
         print("❌ Phase 1 Failed.")
     
+
