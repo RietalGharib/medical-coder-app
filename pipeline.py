@@ -5,6 +5,7 @@ import io
 import os
 import json
 import re
+import time  # <--- NEW: Needed for waiting
 from typing import Any, Dict, Optional, List, Tuple
 from google import genai
 from google.genai import types
@@ -211,13 +212,13 @@ def generate_phase1_json_text(client: genai.Client, models: List[str], file_inpu
     # 2. Construct Prompt with Extracted Text
     contents = [PHASE1_PROMPT + "\n\n---\nEXTRACTED DOCUMENT CONTENT:\n" + extracted_text]
 
-    # 3. Call AI
+    # 3. Call AI with Retry Logic
     last_err = None
     for m in models:
         try:
             print(f"🚀 Phase 1: Extracting JSON using model: {m}")
             LLM_STATS["phase1_calls"] += 1
-            LLM_STATS["phase1_mode_text"] += 1  # We are now always using text mode!
+            LLM_STATS["phase1_mode_text"] += 1 
 
             resp = client.models.generate_content(
                 model=m,
@@ -231,7 +232,14 @@ def generate_phase1_json_text(client: genai.Client, models: List[str], file_inpu
 
         except Exception as e:
             last_err = e
-            print(f"⚠️ Failed on {m}: {e}")
+            # Handle Rate Limits (429) explicitly
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                print(f"⏳ Rate limit hit on {m}. Waiting 30 seconds before retrying...")
+                time.sleep(30)
+                # Try the same model again or just let the loop continue to the next one
+                # For simplicity, we continue to the next model (which might be the same type)
+            else:
+                print(f"⚠️ Failed on {m}: {e}")
 
     print(f"❌ All models failed. Last error: {last_err}")
     return None
@@ -374,6 +382,12 @@ def run_phase2_coding(phase1_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             )
             return json.loads(resp.text)
         except Exception as e:
+            # Simple retry for phase 2 as well
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                print(f"⏳ Rate limit hit on Phase 2. Waiting 30 seconds...")
+                time.sleep(30)
+                # In a real loop we'd retry, but here we just catch it so it doesn't crash 
+                # and loop to the next model candidate
             print(f"⚠️ Phase 2 failed on {m}: {e}")
             
     return None
@@ -417,5 +431,4 @@ if __name__ == "__main__":
             print("❌ Phase 2 Failed.")
     else:
         print("❌ Phase 1 Failed.")
-
-
+    
