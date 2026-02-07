@@ -1,4 +1,4 @@
 streamlit
-google-genai
+pymupdf
+pytesseract
 pillow
-pypdf
