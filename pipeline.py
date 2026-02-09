@@ -9,13 +9,14 @@ import time
 import random
 from typing import Any, Dict, Optional, List, Tuple, Union
 
-import requests
+from openai import OpenAI
 
-# --- CONFIGURATION ---
-HF_MODEL_PHASE1 = "mistralai/Mistral-7B-Instruct-v0.3"
-HF_MODEL_PHASE2 = "mistralai/Mistral-7B-Instruct-v0.3"
+# --- Hugging Face OpenAI-compatible router configuration ---
+HF_BASE_URL = "https://router.huggingface.co/v1"
 
-HF_API_URL = "https://api-inference.huggingface.co/models/{}"
+# Pick a small chat/instruct model that works on HF Inference via router.
+# If this specific model ever errors, tell me the error text and I’ll swap it.
+HF_CHAT_MODEL = "HuggingFaceTB/SmolLM3-3B:hf-inference"  # example format from HF docs :contentReference[oaicite:4]{index=4}
 
 PHASE1_PROMPT = """
 You are extracting data from a paramedic report. Return ONLY valid JSON.
@@ -27,6 +28,16 @@ Schema:
   "notes": { "raw_text": {"value": "string"} }
 }
 """
+
+# ==============================
+# 1) CLIENT
+# ==============================
+def get_client(hf_token: str) -> OpenAI:
+    hf_token = (hf_token or "").strip()
+    if not hf_token:
+        raise ValueError("Hugging Face token is missing (expected hf_...).")
+    # HF router is OpenAI-compatible :contentReference[oaicite:5]{index=5}
+    return OpenAI(base_url=HF_BASE_URL, api_key=hf_token)
 
 # ==============================
 # 2) ABBREVIATION UTILS
@@ -119,7 +130,6 @@ def _safe_json_loads(text: str) -> Dict[str, Any]:
         raise ValueError("Empty model response text")
 
     text = text.strip()
-
     m = _JSON_FENCE_RE.search(text)
     if m:
         text = m.group(1).strip()
@@ -137,7 +147,6 @@ def _backoff_sleep(attempt: int, base: float = 2.0, cap: float = 30.0) -> None:
     time.sleep(delay)
 
 def _truncate_for_model(text: str, max_chars: int = 60_000) -> str:
-    # HF endpoints can be tighter; keep smaller than OpenAI version
     if not text:
         return text
     text = text.strip()
@@ -148,56 +157,14 @@ def _truncate_for_model(text: str, max_chars: int = 60_000) -> str:
     return head + "\n\n--- TRUNCATED ---\n\n" + tail
 
 # ==============================
-# 5) HUGGING FACE CALL
-# ==============================
-def _hf_generate(token: str, model: str, prompt: str, max_new_tokens: int = 800) -> str:
-    token = (token or "").strip()
-    if not token:
-        raise ValueError("Hugging Face token is missing (expected hf_...).")
-
-    url = HF_API_URL.format(model)
-    headers = {"Authorization": f"Bearer {token}"}
-
-    # Most text-generation models accept this inference payload format
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": max_new_tokens,
-            "return_full_text": False,
-            "temperature": 0.2,
-        },
-        "options": {
-            "wait_for_model": True
-        }
-    }
-
-    r = requests.post(url, headers=headers, json=payload, timeout=120)
-
-    # Useful HF errors are in JSON
-    if r.status_code != 200:
-        try:
-            err = r.json()
-        except Exception:
-            err = {"raw": r.text}
-        raise RuntimeError(f"HF API error {r.status_code}: {err}")
-
-    data = r.json()
-
-    # Common response formats:
-    # 1) [{"generated_text": "..."}]
-    # 2) {"generated_text": "..."}  (less common)
-    if isinstance(data, list) and data and isinstance(data[0], dict) and "generated_text" in data[0]:
-        return data[0]["generated_text"] or ""
-    if isinstance(data, dict) and "generated_text" in data:
-        return data["generated_text"] or ""
-
-    # If format differs, fall back:
-    return json.dumps(data)
-
-# ==============================
-# 6) PHASE 1
+# 5) PHASE 1 (HF Router)
 # ==============================
 def extract_phase1(file_input: Union[str, io.BytesIO], api_key: str) -> Dict[str, Any]:
+    try:
+        client = get_client(api_key)
+    except Exception as e:
+        return {"ok": False, "data": None, "error": f"Client init failed: {e}", "model_used": None}
+
     try:
         text = extract_hybrid_content(file_input)
         text = _truncate_for_model(text)
@@ -207,7 +174,6 @@ def extract_phase1(file_input: Union[str, io.BytesIO], api_key: str) -> Dict[str
     if not text.strip():
         return {"ok": False, "data": None, "error": "No text could be extracted from the PDF.", "model_used": None}
 
-    # Give the model very explicit formatting instructions
     prompt = (
         "You are a strict information extraction engine.\n"
         "Return ONLY valid JSON. No markdown. No commentary. No code fences.\n\n"
@@ -221,28 +187,40 @@ def extract_phase1(file_input: Union[str, io.BytesIO], api_key: str) -> Dict[str
 
     for attempt in range(3):
         try:
-            out = _hf_generate(api_key, HF_MODEL_PHASE1, prompt, max_new_tokens=900)
-            data = _safe_json_loads(out)
+            resp = client.chat.completions.create(
+                model=HF_CHAT_MODEL,  # model must include :hf-inference :contentReference[oaicite:6]{index=6}
+                messages=[
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+            )
 
-            # Normalization
+            content = resp.choices[0].message.content or ""
+            data = _safe_json_loads(content)
+
             if isinstance(data, dict) and "notes" in data and isinstance(data["notes"], dict):
                 raw = data["notes"].get("raw_text", {}).get("value", "")
                 norm, _ = expand_tier_a_shorthand(raw)
                 if "raw_text" in data["notes"] and isinstance(data["notes"]["raw_text"], dict):
                     data["notes"]["raw_text"]["value_normalized"] = norm
 
-            return {"ok": True, "data": data, "error": None, "model_used": HF_MODEL_PHASE1}
+            return {"ok": True, "data": data, "error": None, "model_used": HF_CHAT_MODEL}
 
         except Exception as e:
             last_error = str(e)
             _backoff_sleep(attempt)
 
-    return {"ok": False, "data": None, "error": f"All attempts failed in Phase 1. Last error: {last_error}", "model_used": HF_MODEL_PHASE1}
+    return {"ok": False, "data": None, "error": f"All attempts failed in Phase 1. Last error: {last_error}", "model_used": HF_CHAT_MODEL}
 
 # ==============================
-# 7) PHASE 2
+# 6) PHASE 2 (HF Router)
 # ==============================
 def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, Any]:
+    try:
+        client = get_client(api_key)
+    except Exception as e:
+        return {"ok": False, "data": None, "error": f"Client init failed: {e}", "model_used": None}
+
     prompt = (
         "You are a medical coding assistant.\n"
         "Assign ICD-10 codes based on this JSON.\n"
@@ -256,12 +234,16 @@ def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, An
 
     for attempt in range(3):
         try:
-            out = _hf_generate(api_key, HF_MODEL_PHASE2, prompt, max_new_tokens=500)
-            data = _safe_json_loads(out)
-            return {"ok": True, "data": data, "error": None, "model_used": HF_MODEL_PHASE2}
+            resp = client.chat.completions.create(
+                model=HF_CHAT_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+            )
+            content = resp.choices[0].message.content or ""
+            data = _safe_json_loads(content)
+            return {"ok": True, "data": data, "error": None, "model_used": HF_CHAT_MODEL}
         except Exception as e:
             last_error = str(e)
             _backoff_sleep(attempt)
 
-    return {"ok": False, "data": None, "error": f"All attempts failed in Phase 2. Last error: {last_error}", "model_used": HF_MODEL_PHASE2}
-
+    return {"ok": False, "data": None, "error": f"All attempts failed in Phase 2. Last error: {last_error}", "model_used": HF_CHAT_MODEL}
