@@ -14,7 +14,9 @@ from google.genai import types
 
 # --- CONFIGURATION ---
 DEFAULT_MODEL_CANDIDATES = [
-    "gemini-1.5-flash",  # Usually more reliable on limited tiers
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+# Usually more reliable on limited tiers
     "gemini-2.0-flash",
 ]
 
@@ -166,11 +168,10 @@ def _backoff_sleep(attempt: int, base: float = 2.0, cap: float = 60.0) -> None:
     delay = min(cap, base * (2 ** attempt)) + random.uniform(0, 1.0)
     time.sleep(delay)
 
-# ==============================
-# 5) PHASE 1: EXTRACTION
-# ==============================
 def extract_phase1(file_input: Union[str, io.BytesIO], api_key: str) -> Dict[str, Any]:
     """
+    Phase 1: Extract clinical data from the PDF and return structured JSON.
+
     Returns:
       {
         "ok": bool,
@@ -179,18 +180,40 @@ def extract_phase1(file_input: Union[str, io.BytesIO], api_key: str) -> Dict[str
         "model_used": "..." | None
       }
     """
+
+    # ---- Local helper: truncate to avoid "request too large" failures ----
+    def _truncate_for_model(text: str, max_chars: int = 120_000) -> str:
+        """
+        Prevents request-too-large / token overflow issues by keeping
+        the beginning + end of the extracted text.
+        """
+        if not text:
+            return text
+        text = text.strip()
+        if len(text) <= max_chars:
+            return text
+        head = text[:80_000]
+        tail = text[-40_000:]
+        return head + "\n\n--- TRUNCATED ---\n\n" + tail
+
+    # ---- Initialize client ----
     try:
         client = get_client(api_key)
     except Exception as e:
-        return {"ok": False, "data": None, "error": str(e), "model_used": None}
+        return {"ok": False, "data": None, "error": f"Client init failed: {e}", "model_used": None}
 
+    # ---- Extract text from PDF (text layer + OCR) ----
     try:
         text = extract_hybrid_content(file_input)
+        text = _truncate_for_model(text)
     except Exception as e:
-        return {"ok": False, "data": None, "error": str(e), "model_used": None}
+        return {"ok": False, "data": None, "error": f"PDF extraction failed: {e}", "model_used": None}
 
     if not text.strip():
         return {"ok": False, "data": None, "error": "No text could be extracted from the PDF.", "model_used": None}
+
+    # ---- Try candidate models with retry/backoff ----
+    last_error_detail: Optional[str] = None
 
     for model in DEFAULT_MODEL_CANDIDATES:
         for attempt in range(3):
@@ -198,15 +221,23 @@ def extract_phase1(file_input: Union[str, io.BytesIO], api_key: str) -> Dict[str
                 resp = client.models.generate_content(
                     model=model,
                     contents=[PHASE1_PROMPT + "\n\nDATA:\n" + text],
-                    config=types.GenerateContentConfig(response_mime_type="application/json"),
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                    ),
                 )
-                data = _safe_json_loads(resp.text)
 
-                # Normalization
+                # Some responses can be empty/structured differently in edge cases
+                resp_text = getattr(resp, "text", None)
+                if not resp_text:
+                    resp_text = str(resp)
+
+                data = _safe_json_loads(resp_text)
+
+                # ---- Normalization: expand abbreviations in notes.raw_text ----
                 if isinstance(data, dict) and "notes" in data and isinstance(data["notes"], dict):
                     raw = data["notes"].get("raw_text", {}).get("value", "")
                     norm, _ = expand_tier_a_shorthand(raw)
-                    # keep original, add normalized
+
                     if "raw_text" in data["notes"] and isinstance(data["notes"]["raw_text"], dict):
                         data["notes"]["raw_text"]["value_normalized"] = norm
 
@@ -214,6 +245,7 @@ def extract_phase1(file_input: Union[str, io.BytesIO], api_key: str) -> Dict[str
 
             except Exception as e:
                 msg = str(e)
+                last_error_detail = f"Model={model}, attempt={attempt+1}/3, error={msg}"
 
                 # If quota is literally 0, retries are pointless
                 if _is_quota_zero_error(msg):
@@ -225,14 +257,22 @@ def extract_phase1(file_input: Union[str, io.BytesIO], api_key: str) -> Dict[str
                         "model_used": model,
                     }
 
+                # Rate limit: backoff and retry
                 if _is_rate_limit_error(msg):
                     _backoff_sleep(attempt)
                     continue
 
-                # Non-rate-limit errors: stop trying this model
+                # Non-rate-limit errors: stop retrying this model and move on
                 break
 
-    return {"ok": False, "data": None, "error": "All models failed in Phase 1.", "model_used": None}
+    # ---- All models failed ----
+    return {
+        "ok": False,
+        "data": None,
+        "error": f"All models failed in Phase 1. Last error: {last_error_detail}",
+        "model_used": None,
+    }
+
 
 # ==============================
 # 6) PHASE 2: CODING
@@ -282,3 +322,4 @@ def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, An
                 break
 
     return {"ok": False, "data": None, "error": "All models failed in Phase 2.", "model_used": None}
+
