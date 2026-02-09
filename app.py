@@ -1,6 +1,3 @@
-# =========================
-# app.py  (REPLACE FULL FILE)
-# =========================
 import streamlit as st
 import pipeline
 import os
@@ -13,12 +10,14 @@ st.markdown("This tool processes medical PDFs and assigns ICD-10 codes using AI.
 
 with st.sidebar:
     st.header("🔑 Configuration")
-    user_api_key = st.text_input("Enter OpenAI API Key", type="password")
+    user_api_key = st.text_input("Enter Hugging Face API Token (hf_...)", type="password")
+
+    st.caption("Tip: Create a Read token at https://huggingface.co/settings/tokens")
 
     if not user_api_key:
-        st.warning("⚠️ You must enter an API Key to run the analysis.")
+        st.warning("⚠️ You must enter a Hugging Face token to run the analysis.")
     else:
-        st.success("Key ready!")
+        st.success("Token ready!")
 
 uploaded_file = st.file_uploader("Upload Medical Report (PDF)", type=["pdf"])
 
@@ -34,7 +33,7 @@ if uploaded_file:
 
     if st.button("Run Analysis Pipeline", type="primary"):
         if not user_api_key:
-            st.error("❌ Please enter your API Key in the sidebar first.")
+            st.error("❌ Please enter your Hugging Face token in the sidebar first.")
             st.stop()
 
         # --- PHASE 1 ---
