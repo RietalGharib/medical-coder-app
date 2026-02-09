@@ -1,3 +1,6 @@
+# =========================
+# pipeline.py  (REPLACE FULL FILE)
+# =========================
 import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
@@ -9,16 +12,11 @@ import time
 import random
 from typing import Any, Dict, Optional, List, Tuple, Union
 
-from google import genai
-from google.genai import types
+from openai import OpenAI
 
 # --- CONFIGURATION ---
-DEFAULT_MODEL_CANDIDATES = [
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-# Usually more reliable on limited tiers
-    "gemini-2.0-flash",
-]
+OPENAI_MODEL_PHASE1 = "gpt-4o-mini"
+OPENAI_MODEL_PHASE2 = "gpt-4o-mini"
 
 PHASE1_PROMPT = """
 You are extracting data from a paramedic report. Return ONLY valid JSON.
@@ -34,11 +32,11 @@ Schema:
 # ==============================
 # 1) CLIENT
 # ==============================
-def get_client(api_key: str):
+def get_client(api_key: str) -> OpenAI:
     api_key = (api_key or "").strip()
     if not api_key:
         raise ValueError("API Key is missing.")
-    return genai.Client(api_key=api_key)
+    return OpenAI(api_key=api_key)
 
 # ==============================
 # 2) ABBREVIATION UTILS
@@ -129,25 +127,19 @@ def extract_hybrid_content(source: Union[str, io.BytesIO]) -> str:
         doc.close()
 
 # ==============================
-# 4) GENAI HELPERS
+# 4) JSON HELPERS
 # ==============================
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
 def _safe_json_loads(text: str) -> Dict[str, Any]:
-    """
-    Gemini sometimes returns JSON in code fences or with stray text.
-    This tries to extract the JSON object reliably.
-    """
     if not text:
         raise ValueError("Empty model response text")
 
     text = text.strip()
-
     m = _JSON_FENCE_RE.search(text)
     if m:
         text = m.group(1).strip()
 
-    # last resort: try to find first {...} block
     if not text.startswith("{"):
         start = text.find("{")
         end = text.rfind("}")
@@ -156,53 +148,29 @@ def _safe_json_loads(text: str) -> Dict[str, Any]:
 
     return json.loads(text)
 
-def _is_quota_zero_error(msg: str) -> bool:
-    # This matches the error you pasted: "limit: 0"
-    return ("RESOURCE_EXHAUSTED" in msg or "429" in msg) and ("limit: 0" in msg)
-
-def _is_rate_limit_error(msg: str) -> bool:
-    return ("RESOURCE_EXHAUSTED" in msg or "429" in msg)
-
-def _backoff_sleep(attempt: int, base: float = 2.0, cap: float = 60.0) -> None:
-    # exponential backoff + jitter
-    delay = min(cap, base * (2 ** attempt)) + random.uniform(0, 1.0)
+def _backoff_sleep(attempt: int, base: float = 2.0, cap: float = 30.0) -> None:
+    delay = min(cap, base * (2 ** attempt)) + random.uniform(0, 0.8)
     time.sleep(delay)
 
+def _truncate_for_model(text: str, max_chars: int = 120_000) -> str:
+    if not text:
+        return text
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    head = text[:80_000]
+    tail = text[-40_000:]
+    return head + "\n\n--- TRUNCATED ---\n\n" + tail
+
+# ==============================
+# 5) PHASE 1: EXTRACTION (OpenAI)
+# ==============================
 def extract_phase1(file_input: Union[str, io.BytesIO], api_key: str) -> Dict[str, Any]:
-    """
-    Phase 1: Extract clinical data from the PDF and return structured JSON.
-
-    Returns:
-      {
-        "ok": bool,
-        "data": {...} | None,
-        "error": "..." | None,
-        "model_used": "..." | None
-      }
-    """
-
-    # ---- Local helper: truncate to avoid "request too large" failures ----
-    def _truncate_for_model(text: str, max_chars: int = 120_000) -> str:
-        """
-        Prevents request-too-large / token overflow issues by keeping
-        the beginning + end of the extracted text.
-        """
-        if not text:
-            return text
-        text = text.strip()
-        if len(text) <= max_chars:
-            return text
-        head = text[:80_000]
-        tail = text[-40_000:]
-        return head + "\n\n--- TRUNCATED ---\n\n" + tail
-
-    # ---- Initialize client ----
     try:
         client = get_client(api_key)
     except Exception as e:
         return {"ok": False, "data": None, "error": f"Client init failed: {e}", "model_used": None}
 
-    # ---- Extract text from PDF (text layer + OCR) ----
     try:
         text = extract_hybrid_content(file_input)
         text = _truncate_for_model(text)
@@ -212,114 +180,75 @@ def extract_phase1(file_input: Union[str, io.BytesIO], api_key: str) -> Dict[str
     if not text.strip():
         return {"ok": False, "data": None, "error": "No text could be extracted from the PDF.", "model_used": None}
 
-    # ---- Try candidate models with retry/backoff ----
-    last_error_detail: Optional[str] = None
+    last_error: Optional[str] = None
 
-    for model in DEFAULT_MODEL_CANDIDATES:
-        for attempt in range(3):
-            try:
-                resp = client.models.generate_content(
-                    model=model,
-                    contents=[PHASE1_PROMPT + "\n\nDATA:\n" + text],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                    ),
-                )
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL_PHASE1,
+                messages=[
+                    {"role": "system", "content": "You are a strict information extraction engine. Return ONLY valid JSON. No markdown."},
+                    {"role": "user", "content": PHASE1_PROMPT + "\n\nDATA:\n" + text},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0,
+            )
 
-                # Some responses can be empty/structured differently in edge cases
-                resp_text = getattr(resp, "text", None)
-                if not resp_text:
-                    resp_text = str(resp)
+            content = resp.choices[0].message.content or ""
+            data = _safe_json_loads(content)
 
-                data = _safe_json_loads(resp_text)
+            # Normalization: expand abbreviations in notes.raw_text
+            if isinstance(data, dict) and "notes" in data and isinstance(data["notes"], dict):
+                raw = data["notes"].get("raw_text", {}).get("value", "")
+                norm, _ = expand_tier_a_shorthand(raw)
+                if "raw_text" in data["notes"] and isinstance(data["notes"]["raw_text"], dict):
+                    data["notes"]["raw_text"]["value_normalized"] = norm
 
-                # ---- Normalization: expand abbreviations in notes.raw_text ----
-                if isinstance(data, dict) and "notes" in data and isinstance(data["notes"], dict):
-                    raw = data["notes"].get("raw_text", {}).get("value", "")
-                    norm, _ = expand_tier_a_shorthand(raw)
+            return {"ok": True, "data": data, "error": None, "model_used": OPENAI_MODEL_PHASE1}
 
-                    if "raw_text" in data["notes"] and isinstance(data["notes"]["raw_text"], dict):
-                        data["notes"]["raw_text"]["value_normalized"] = norm
+        except Exception as e:
+            last_error = str(e)
+            _backoff_sleep(attempt)
 
-                return {"ok": True, "data": data, "error": None, "model_used": model}
-
-            except Exception as e:
-                msg = str(e)
-                last_error_detail = f"Model={model}, attempt={attempt+1}/3, error={msg}"
-
-                # If quota is literally 0, retries are pointless
-                if _is_quota_zero_error(msg):
-                    return {
-                        "ok": False,
-                        "data": None,
-                        "error": "Gemini quota is 0 for this API key/project (limit: 0). "
-                                 "Use a different key/project or enable billing/quota.",
-                        "model_used": model,
-                    }
-
-                # Rate limit: backoff and retry
-                if _is_rate_limit_error(msg):
-                    _backoff_sleep(attempt)
-                    continue
-
-                # Non-rate-limit errors: stop retrying this model and move on
-                break
-
-    # ---- All models failed ----
-    return {
-        "ok": False,
-        "data": None,
-        "error": f"All models failed in Phase 1. Last error: {last_error_detail}",
-        "model_used": None,
-    }
-
+    return {"ok": False, "data": None, "error": f"All attempts failed in Phase 1. Last error: {last_error}", "model_used": OPENAI_MODEL_PHASE1}
 
 # ==============================
-# 6) PHASE 2: CODING
+# 6) PHASE 2: CODING (OpenAI)
 # ==============================
 def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, Any]:
-    """
-    Returns same envelope as phase1.
-    """
     try:
         client = get_client(api_key)
     except Exception as e:
-        return {"ok": False, "data": None, "error": str(e), "model_used": None}
+        return {"ok": False, "data": None, "error": f"Client init failed: {e}", "model_used": None}
 
     prompt = (
         "Assign ICD-10 codes based on this JSON. "
-        "Return ONLY JSON in this schema: {\"coding_results\": [{\"icd10_code\":\"...\",\"description\":\"...\"}]}\n\n"
+        "Return ONLY JSON in this schema: "
+        "{\"coding_results\": [{\"icd10_code\":\"...\",\"description\":\"...\"}]}\n\n"
         + json.dumps(phase1_data, ensure_ascii=False)
     )
 
-    for model in DEFAULT_MODEL_CANDIDATES:
-        for attempt in range(3):
-            try:
-                resp = client.models.generate_content(
-                    model=model,
-                    contents=[prompt],
-                    config=types.GenerateContentConfig(response_mime_type="application/json"),
-                )
-                data = _safe_json_loads(resp.text)
-                return {"ok": True, "data": data, "error": None, "model_used": model}
+    last_error: Optional[str] = None
 
-            except Exception as e:
-                msg = str(e)
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL_PHASE2,
+                messages=[
+                    {"role": "system", "content": "Return ONLY valid JSON. No markdown."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0,
+            )
 
-                if _is_quota_zero_error(msg):
-                    return {
-                        "ok": False,
-                        "data": None,
-                        "error": "Gemini quota is 0 for this API key/project (limit: 0). "
-                                 "Use a different key/project or enable billing/quota.",
-                        "model_used": model,
-                    }
+            content = resp.choices[0].message.content or ""
+            data = _safe_json_loads(content)
 
-                if _is_rate_limit_error(msg):
-                    _backoff_sleep(attempt)
-                    continue
+            return {"ok": True, "data": data, "error": None, "model_used": OPENAI_MODEL_PHASE2}
 
-                break
+        except Exception as e:
+            last_error = str(e)
+            _backoff_sleep(attempt)
 
-    return {"ok": False, "data": None, "error": "All models failed in Phase 2.", "model_used": None}
-
+    return {"ok": False, "data": None, "error": f"All attempts failed in Phase 2. Last error: {last_error}", "model_used": OPENAI_MODEL_PHASE2}
