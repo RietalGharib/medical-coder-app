@@ -1,5 +1,5 @@
 # =========================
-# pipeline.py  (FULL REPLACEMENT - FIXED MODELS)
+# pipeline.py  (FULL REPLACEMENT)
 # =========================
 import fitz  # PyMuPDF
 import pytesseract
@@ -17,14 +17,14 @@ from openai import OpenAI
 # --- Hugging Face OpenAI-compatible router configuration ---
 HF_BASE_URL = "https://router.huggingface.co/v1"
 
+# Models
 # Phase 1: Small extraction model
-HF_CHAT_MODEL = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+HF_CHAT_MODEL = "HuggingFaceTB/SmolLM3-3B:hf-inference"
 
-# Phase 2: Coding models (Updated to valid model IDs)
+# Phase 2: Coding models (Ordered by reliability for JSON)
 PHASE2_MODEL_CANDIDATES = [
-    "Qwen/Qwen2.5-1.5B-Instruct",          # Best small model for JSON
-    "HuggingFaceTB/SmolLM2-1.7B-Instruct", # Corrected name (was 1.3B)
-    "google/gemma-2-2b-it"                 # Another reliable fallback
+    "Qwen/Qwen2.5-1.5B-Instruct",        # Excellent at strict JSON
+    "HuggingFaceTB/SmolLM2-1.3B-Instruct", # Backup
 ]
 
 # --- Global Stats (Prevents NameError) ---
@@ -232,6 +232,7 @@ def _safe_json_loads(text: str) -> Dict[str, Any]:
             pass  # Fall through to other checks
 
     # 3. If parsing failed, check if the model just gave us text
+    # If no curly braces exist, it's definitely not JSON.
     if "{" not in text:
         return {
             "coding_results": [],
@@ -368,3 +369,4 @@ def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, An
                     _backoff_sleep(attempt)
     
     return {"ok": False, "data": None, "error": f"Phase 2 failed after all models. Last error: {last_err}", "model_used": None}
+
