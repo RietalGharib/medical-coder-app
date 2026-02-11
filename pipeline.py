@@ -289,8 +289,10 @@ REQUIRED OUTPUT FORMAT (JSON ONLY):
 
 PHASE2_MODEL_CANDIDATES = [
     HF_CHAT_MODEL,
-    "mistralai/Mistral-7B-Instruct-v0.3:hf-inference",
+    "HuggingFaceTB/SmolLM3-3B:hf-inference",  # same chat model as fallback (safe)
+    "Qwen/Qwen2.5-3B-Instruct:hf-inference",  # often works as chat via router
 ]
+
 
 LLM_STATS: Dict[str, int] = {"phase2_calls": 0}
 
@@ -333,3 +335,4 @@ def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, An
                 _backoff_sleep(attempt)
 
     return {"ok": False, "data": None, "error": f"Phase 2 failed. Last error: {last_err}", "model_used": None}
+
