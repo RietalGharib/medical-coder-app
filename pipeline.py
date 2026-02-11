@@ -1,5 +1,16 @@
+Here is the fully updated and rewritten `pipeline.py`.
+
+This version includes:
+
+1. **The Fix for "Hanging":** It uses the robust `_safe_json_loads` that can handle conversational text without crashing the loop.
+2. **The Fix for the Crash:** It defines `LLM_STATS` globally so you don't get the `NameError`.
+3. **Optimized Phase 2:** It uses the "System" role and a shorter timeout (45s) to prevent stalling.
+
+You can replace your entire file with this code.
+
+```python
 # =========================
-# pipeline.py  (REPLACE FULL FILE)
+# pipeline.py  (FULL REPLACEMENT)
 # =========================
 import fitz  # PyMuPDF
 import pytesseract
@@ -17,9 +28,20 @@ from openai import OpenAI
 # --- Hugging Face OpenAI-compatible router configuration ---
 HF_BASE_URL = "https://router.huggingface.co/v1"
 
-# Small chat/instruct model that works on HF Inference via router.
+# Models
+# Phase 1: Small extraction model
 HF_CHAT_MODEL = "HuggingFaceTB/SmolLM3-3B:hf-inference"
 
+# Phase 2: Coding models (Ordered by reliability for JSON)
+PHASE2_MODEL_CANDIDATES = [
+    "Qwen/Qwen2.5-1.5B-Instruct",        # Excellent at strict JSON
+    "HuggingFaceTB/SmolLM2-1.3B-Instruct", # Backup
+]
+
+# --- Global Stats (Prevents NameError) ---
+LLM_STATS: Dict[str, int] = {"phase2_calls": 0}
+
+# --- Prompts ---
 PHASE1_PROMPT = """
 You are extracting data from a paramedic report. Return ONLY valid JSON.
 Schema:
@@ -29,6 +51,76 @@ Schema:
   "chief_complaint": { "text": {"value": "string"} },
   "notes": { "raw_text": {"value": "string"} }
 }
+"""
+
+PHASE2_PROMPT_TEMPLATE = """
+You are a professional Medical Coder.
+Your task is to assign ICD-10-CM codes based STRICTLY on the extracted text provided.
+Do not infer, assume, or reinterpret clinical meaning beyond what is explicitly documented.
+
+---
+SAFE ABBREVIATION REFERENCE GUIDE (UNAMBIGUOUS ONLY):
+The following abbreviations are guaranteed to be unambiguous in this context and may be safely interpreted:
+
+- "PVC" / "PVCs" → Premature Ventricular Contractions
+- "SOB" → Shortness of Breath
+- "SpO2" / "SPO2" → Oxygen saturation
+- "GCS" → Glasgow Coma Scale
+- "ECG" / "EKG" → Electrocardiogram
+- "IV" → Intravenous
+- "NS" → Normal saline
+- "ETCO2" → End-tidal carbon dioxide
+- "RR" → Respiratory rate
+- "HR" → Heart rate
+- "BP" → Blood pressure
+
+No other abbreviations may be expanded unless the full meaning is explicitly written in the text.
+
+---
+IMPORTANT SAFETY RULES (MANDATORY):
+
+1. NEVER expand ambiguous abbreviations (e.g., DOB, CP, BS, PT, RA, MI, OD).
+   - Do NOT guess their meaning from context.
+   - Do NOT code based on them unless the expanded meaning is explicitly written out.
+
+2. Do NOT infer qualifiers, severity, timing, or subtypes.
+   - Examples: "on exertion", "acute", "chronic", "with complication".
+   - These may ONLY be used if the exact wording appears in the text.
+
+3. Prefer conservative, unspecified symptom codes when documentation lacks specificity.
+   - Example: "chest discomfort" without further qualifiers → code as R07.4 (Chest pain, unspecified).
+
+4. Code ONLY what is clearly and explicitly documented.
+   - If documentation is vague or ambiguous, do NOT code it.
+
+5. If a condition is suspected, ruled out, or not confirmed,
+   code the presenting symptom — NOT the suspected diagnosis.
+
+---
+PATIENT DATA (JSON):
+{patient_data_json}
+
+---
+INSTRUCTIONS:
+
+1. Identify clinical findings, symptoms, and impressions exactly as written.
+2. Apply ONLY the SAFE abbreviation guide above.
+3. Assign the most accurate ICD-10-CM code supported by explicit text.
+4. Do NOT add, infer, or refine beyond documentation.
+
+---
+REQUIRED OUTPUT FORMAT (JSON ONLY):
+
+{{
+  "coding_results": [
+    {{
+      "icd10_code": "string (e.g., R07.4)",
+      "description": "string (official ICD-10 description)",
+      "source_text": "string (exact text snippet being coded)",
+      "reasoning": "string (why this code is supported by the text)"
+    }}
+  ]
+}}
 """
 
 # ==============================
@@ -122,25 +214,44 @@ def extract_hybrid_content(source: Union[str, io.BytesIO]) -> str:
         doc.close()
 
 # ==============================
-# 4) JSON HELPERS
+# 4) JSON HELPERS (ROBUST VERSION)
 # ==============================
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
 def _safe_json_loads(text: str) -> Dict[str, Any]:
+    """
+    Robustly parses JSON, handling common LLM errors like conversational wrapping.
+    """
     if not text:
         raise ValueError("Empty model response text")
 
     text = text.strip()
+    
+    # 1. Try to find markdown code blocks first
     m = _JSON_FENCE_RE.search(text)
     if m:
         text = m.group(1).strip()
+    
+    # 2. Heuristic: locate the first '{' and last '}'
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = text[start : end + 1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass  # Fall through to other checks
 
-    if not text.startswith("{"):
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            text = text[start:end + 1]
+    # 3. If parsing failed, check if the model just gave us text
+    # If no curly braces exist, it's definitely not JSON.
+    if "{" not in text:
+        return {
+            "coding_results": [],
+            "error": "Model returned plain text instead of JSON",
+            "raw_response": text[:200]
+        }
 
+    # 4. Last ditch attempt: Strict load (will raise if invalid)
     return json.loads(text)
 
 def _backoff_sleep(attempt: int, base: float = 2.0, cap: float = 30.0) -> None:
@@ -215,88 +326,8 @@ def extract_phase1(file_input: Union[str, io.BytesIO], api_key: str) -> Dict[str
     return {"ok": False, "data": None, "error": f"All attempts failed in Phase 1. Last error: {last_error}", "model_used": HF_CHAT_MODEL}
 
 # ==================================
-# 6) PHASE 2: CODING AGENT (YOUR NEW VERSION, INTEGRATED)
+# 6) PHASE 2: CODING AGENT (FIXED)
 # ==================================
-PHASE2_PROMPT_TEMPLATE = """
-You are a professional Medical Coder.
-Your task is to assign ICD-10-CM codes based STRICTLY on the extracted text provided.
-Do not infer, assume, or reinterpret clinical meaning beyond what is explicitly documented.
-
----
-SAFE ABBREVIATION REFERENCE GUIDE (UNAMBIGUOUS ONLY):
-The following abbreviations are guaranteed to be unambiguous in this context and may be safely interpreted:
-
-- "PVC" / "PVCs" → Premature Ventricular Contractions
-- "SOB" → Shortness of Breath
-- "SpO2" / "SPO2" → Oxygen saturation
-- "GCS" → Glasgow Coma Scale
-- "ECG" / "EKG" → Electrocardiogram
-- "IV" → Intravenous
-- "NS" → Normal saline
-- "ETCO2" → End-tidal carbon dioxide
-- "RR" → Respiratory rate
-- "HR" → Heart rate
-- "BP" → Blood pressure
-
-No other abbreviations may be expanded unless the full meaning is explicitly written in the text.
-
----
-IMPORTANT SAFETY RULES (MANDATORY):
-
-1. NEVER expand ambiguous abbreviations (e.g., DOB, CP, BS, PT, RA, MI, OD).
-   - Do NOT guess their meaning from context.
-   - Do NOT code based on them unless the expanded meaning is explicitly written out.
-
-2. Do NOT infer qualifiers, severity, timing, or subtypes.
-   - Examples: "on exertion", "acute", "chronic", "with complication".
-   - These may ONLY be used if the exact wording appears in the text.
-
-3. Prefer conservative, unspecified symptom codes when documentation lacks specificity.
-   - Example: "chest discomfort" without further qualifiers → code as R07.4 (Chest pain, unspecified).
-
-4. Code ONLY what is clearly and explicitly documented.
-   - If documentation is vague or ambiguous, do NOT code it.
-
-5. If a condition is suspected, ruled out, or not confirmed,
-   code the presenting symptom — NOT the suspected diagnosis.
-
----
-PATIENT DATA (JSON):
-{patient_data_json}
-
----
-INSTRUCTIONS:
-
-1. Identify clinical findings, symptoms, and impressions exactly as written.
-2. Apply ONLY the SAFE abbreviation guide above.
-3. Assign the most accurate ICD-10-CM code supported by explicit text.
-4. Do NOT add, infer, or refine beyond documentation.
-
----
-REQUIRED OUTPUT FORMAT (JSON ONLY):
-
-{{
-  "coding_results": [
-    {{
-      "icd10_code": "string (e.g., R07.4)",
-      "description": "string (official ICD-10 description)",
-      "source_text": "string (exact text snippet being coded)",
-      "reasoning": "string (why this code is supported by the text)"
-    }}
-  ]
-}}
-"""
-
-# ==================================
-# 6) FIXED PHASE 2: CODING AGENT
-# ==================================
-
-# refined model list - using models more likely to be active on the router
-PHASE2_MODEL_CANDIDATES = [
-    "HuggingFaceTB/SmolLM2-1.3B-Instruct", # Very fast, good for simple JSON
-    "Qwen/Qwen2.5-1.5B-Instruct",        # Excellent at following JSON formats
-]
-
 def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, Any]:
     try:
         client = get_client(api_key)
@@ -313,10 +344,14 @@ def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, An
     last_err: Optional[str] = None
 
     for m in PHASE2_MODEL_CANDIDATES:
-        print(f"DEBUG: Attempting Phase 2 with model: {m}") # Helpful for local debugging
-        for attempt in range(2): # Reduced to 2 attempts per model to save time
+        print(f"DEBUG: Attempting Phase 2 with model: {m}") 
+        
+        # Reduced to 2 attempts per model to save time and stop infinite hangs
+        for attempt in range(2): 
             try:
-                LLM_STATS["phase2_calls"] += 1
+                # Safely increment stats
+                if "phase2_calls" in LLM_STATS:
+                    LLM_STATS["phase2_calls"] += 1
 
                 resp = client.chat.completions.create(
                     model=m,
@@ -325,7 +360,7 @@ def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, An
                         {"role": "user", "content": prompt}
                     ],
                     temperature=0.1, # Slight temperature helps prevent repetitive looping
-                    timeout=45,      # Slightly shorter timeout
+                    timeout=45,      # Shorter timeout to fail fast
                     max_tokens=1000  # Ensure the model doesn't ramble forever
                 )
 
@@ -335,6 +370,7 @@ def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, An
                 if not content.strip():
                     raise ValueError("Model returned empty response")
 
+                # Uses robust parser
                 data = _safe_json_loads(content)
                 return {"ok": True, "data": data, "error": None, "model_used": m}
 
@@ -345,3 +381,5 @@ def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, An
                     _backoff_sleep(attempt)
     
     return {"ok": False, "data": None, "error": f"Phase 2 failed after all models. Last error: {last_err}", "model_used": None}
+
+```
