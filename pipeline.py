@@ -1,5 +1,5 @@
 # =========================
-# pipeline.py  (FULL REPLACEMENT)
+# pipeline.py  (REPLACE FULL FILE)
 # =========================
 import fitz  # PyMuPDF
 import pytesseract
@@ -17,19 +17,9 @@ from openai import OpenAI
 # --- Hugging Face OpenAI-compatible router configuration ---
 HF_BASE_URL = "https://router.huggingface.co/v1"
 
-# Models
-# Phase 1: Small extraction model
-HF_CHAT_MODEL = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
-# Phase 2: Coding models (Ordered by reliability for JSON)
-PHASE2_MODEL_CANDIDATES = [
-    "Qwen/Qwen2.5-1.5B-Instruct",        # Excellent at strict JSON
-    "HuggingFaceTB/SmolLM2-1.7B-Instruct", # Backup
-]
+# Small chat/instruct model that works on HF Inference via router.
+HF_CHAT_MODEL = "HuggingFaceTB/SmolLM3-3B:hf-inference"
 
-# --- Global Stats (Prevents NameError) ---
-LLM_STATS: Dict[str, int] = {"phase2_calls": 0}
-
-# --- Prompts ---
 PHASE1_PROMPT = """
 You are extracting data from a paramedic report. Return ONLY valid JSON.
 Schema:
@@ -39,76 +29,6 @@ Schema:
   "chief_complaint": { "text": {"value": "string"} },
   "notes": { "raw_text": {"value": "string"} }
 }
-"""
-
-PHASE2_PROMPT_TEMPLATE = """
-You are a professional Medical Coder.
-Your task is to assign ICD-10-CM codes based STRICTLY on the extracted text provided.
-Do not infer, assume, or reinterpret clinical meaning beyond what is explicitly documented.
-
----
-SAFE ABBREVIATION REFERENCE GUIDE (UNAMBIGUOUS ONLY):
-The following abbreviations are guaranteed to be unambiguous in this context and may be safely interpreted:
-
-- "PVC" / "PVCs" → Premature Ventricular Contractions
-- "SOB" → Shortness of Breath
-- "SpO2" / "SPO2" → Oxygen saturation
-- "GCS" → Glasgow Coma Scale
-- "ECG" / "EKG" → Electrocardiogram
-- "IV" → Intravenous
-- "NS" → Normal saline
-- "ETCO2" → End-tidal carbon dioxide
-- "RR" → Respiratory rate
-- "HR" → Heart rate
-- "BP" → Blood pressure
-
-No other abbreviations may be expanded unless the full meaning is explicitly written in the text.
-
----
-IMPORTANT SAFETY RULES (MANDATORY):
-
-1. NEVER expand ambiguous abbreviations (e.g., DOB, CP, BS, PT, RA, MI, OD).
-   - Do NOT guess their meaning from context.
-   - Do NOT code based on them unless the expanded meaning is explicitly written out.
-
-2. Do NOT infer qualifiers, severity, timing, or subtypes.
-   - Examples: "on exertion", "acute", "chronic", "with complication".
-   - These may ONLY be used if the exact wording appears in the text.
-
-3. Prefer conservative, unspecified symptom codes when documentation lacks specificity.
-   - Example: "chest discomfort" without further qualifiers → code as R07.4 (Chest pain, unspecified).
-
-4. Code ONLY what is clearly and explicitly documented.
-   - If documentation is vague or ambiguous, do NOT code it.
-
-5. If a condition is suspected, ruled out, or not confirmed,
-   code the presenting symptom — NOT the suspected diagnosis.
-
----
-PATIENT DATA (JSON):
-{patient_data_json}
-
----
-INSTRUCTIONS:
-
-1. Identify clinical findings, symptoms, and impressions exactly as written.
-2. Apply ONLY the SAFE abbreviation guide above.
-3. Assign the most accurate ICD-10-CM code supported by explicit text.
-4. Do NOT add, infer, or refine beyond documentation.
-
----
-REQUIRED OUTPUT FORMAT (JSON ONLY):
-
-{{
-  "coding_results": [
-    {{
-      "icd10_code": "string (e.g., R07.4)",
-      "description": "string (official ICD-10 description)",
-      "source_text": "string (exact text snippet being coded)",
-      "reasoning": "string (why this code is supported by the text)"
-    }}
-  ]
-}}
 """
 
 # ==============================
@@ -202,44 +122,25 @@ def extract_hybrid_content(source: Union[str, io.BytesIO]) -> str:
         doc.close()
 
 # ==============================
-# 4) JSON HELPERS (ROBUST VERSION)
+# 4) JSON HELPERS
 # ==============================
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
 def _safe_json_loads(text: str) -> Dict[str, Any]:
-    """
-    Robustly parses JSON, handling common LLM errors like conversational wrapping.
-    """
     if not text:
         raise ValueError("Empty model response text")
 
     text = text.strip()
-    
-    # 1. Try to find markdown code blocks first
     m = _JSON_FENCE_RE.search(text)
     if m:
         text = m.group(1).strip()
-    
-    # 2. Heuristic: locate the first '{' and last '}'
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidate = text[start : end + 1]
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            pass  # Fall through to other checks
 
-    # 3. If parsing failed, check if the model just gave us text
-    # If no curly braces exist, it's definitely not JSON.
-    if "{" not in text:
-        return {
-            "coding_results": [],
-            "error": "Model returned plain text instead of JSON",
-            "raw_response": text[:200]
-        }
+    if not text.startswith("{"):
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            text = text[start:end + 1]
 
-    # 4. Last ditch attempt: Strict load (will raise if invalid)
     return json.loads(text)
 
 def _backoff_sleep(attempt: int, base: float = 2.0, cap: float = 30.0) -> None:
@@ -314,7 +215,7 @@ def extract_phase1(file_input: Union[str, io.BytesIO], api_key: str) -> Dict[str
     return {"ok": False, "data": None, "error": f"All attempts failed in Phase 1. Last error: {last_error}", "model_used": HF_CHAT_MODEL}
 
 # ==================================
-# 6) PHASE 2: CODING AGENT (FIXED)
+# 6) PHASE 2: CODING AGENT (YOUR NEW VERSION, INTEGRATED)
 # ==================================
 def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, Any]:
     try:
@@ -368,5 +269,6 @@ def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, An
                     _backoff_sleep(attempt)
     
     return {"ok": False, "data": None, "error": f"Phase 2 failed after all models. Last error: {last_err}", "model_used": None}
+
 
 
