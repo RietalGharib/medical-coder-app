@@ -3,3 +3,4 @@ pymupdf
 pytesseract
 pillow
 requests
+openai
