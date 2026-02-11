@@ -287,52 +287,61 @@ REQUIRED OUTPUT FORMAT (JSON ONLY):
 }}
 """
 
+# ==================================
+# 6) FIXED PHASE 2: CODING AGENT
+# ==================================
+
+# refined model list - using models more likely to be active on the router
 PHASE2_MODEL_CANDIDATES = [
-    HF_CHAT_MODEL,
-    "HuggingFaceTB/SmolLM3-3B:hf-inference",  # same chat model as fallback (safe)
-    "Qwen/Qwen2.5-3B-Instruct:hf-inference",  # often works as chat via router
+    "HuggingFaceTB/SmolLM2-1.3B-Instruct", # Very fast, good for simple JSON
+    "Qwen/Qwen2.5-1.5B-Instruct",        # Excellent at following JSON formats
 ]
 
-
-LLM_STATS: Dict[str, int] = {"phase2_calls": 0}
-
 def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, Any]:
-    """
-    Integrated Phase 2:
-    - Uses your prompt template exactly
-    - Tries models in order
-    - Returns Streamlit envelope like Phase 1
-    """
     try:
         client = get_client(api_key)
     except Exception as e:
         return {"ok": False, "data": None, "error": f"Client init failed: {e}", "model_used": None}
 
+    # Ensure we aren't passing a massive object that breaks the context window
     data_str = json.dumps(phase1_data, indent=2, ensure_ascii=False)
+    
+    # Strictly enforce NO markdown in the prompt to help small models
     prompt = PHASE2_PROMPT_TEMPLATE.format(patient_data_json=data_str)
+    prompt += "\nIMPORTANT: Provide ONLY the JSON object. Do not include '```json' tags."
 
     last_err: Optional[str] = None
 
     for m in PHASE2_MODEL_CANDIDATES:
-        for attempt in range(3):
+        print(f"DEBUG: Attempting Phase 2 with model: {m}") # Helpful for local debugging
+        for attempt in range(2): # Reduced to 2 attempts per model to save time
             try:
                 LLM_STATS["phase2_calls"] += 1
 
                 resp = client.chat.completions.create(
                     model=m,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.0,
-                    timeout=60,  # prevent long hangs
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant that only outputs JSON."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.1, # Slight temperature helps prevent repetitive looping
+                    timeout=45,      # Slightly shorter timeout
+                    max_tokens=1000  # Ensure the model doesn't ramble forever
                 )
 
                 content = resp.choices[0].message.content or ""
-                data = _safe_json_loads(content)
+                
+                # If content is empty, force an error to trigger next attempt
+                if not content.strip():
+                    raise ValueError("Model returned empty response")
 
+                data = _safe_json_loads(content)
                 return {"ok": True, "data": data, "error": None, "model_used": m}
 
             except Exception as e:
-                last_err = f"model={m}, attempt={attempt+1}/3, error={e}"
-                _backoff_sleep(attempt)
-
-    return {"ok": False, "data": None, "error": f"Phase 2 failed. Last error: {last_err}", "model_used": None}
-
+                last_err = f"model={m}, attempt={attempt+1}, error={str(e)}"
+                print(f"DEBUG: {last_err}")
+                if attempt < 1: 
+                    _backoff_sleep(attempt)
+    
+    return {"ok": False, "data": None, "error": f"Phase 2 failed after all models. Last error: {last_err}", "model_used": None}
