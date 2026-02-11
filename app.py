@@ -72,7 +72,9 @@ if uploaded_file:
             st.markdown(
                 f"""
                 <div style="background:#f0f2f6;padding:10px;border-radius:5px;border-left:4px solid #ff4b4b;margin-bottom:10px">
-                    <b>{item.get('icd10_code')}</b>: {item.get('description')}
+                    <b>{item.get('icd10_code')}</b>: {item.get('description')}<br/>
+                    <small><b>Source:</b> {item.get('source_text','')}</small><br/>
+                    <small><b>Reasoning:</b> {item.get('reasoning','')}</small>
                 </div>
                 """,
                 unsafe_allow_html=True,
