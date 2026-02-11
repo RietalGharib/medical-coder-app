@@ -1,3 +1,6 @@
+# =========================
+# pipeline.py  (REPLACE FULL FILE)
+# =========================
 import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
@@ -14,9 +17,8 @@ from openai import OpenAI
 # --- Hugging Face OpenAI-compatible router configuration ---
 HF_BASE_URL = "https://router.huggingface.co/v1"
 
-# Pick a small chat/instruct model that works on HF Inference via router.
-# If this specific model ever errors, tell me the error text and I’ll swap it.
-HF_CHAT_MODEL = "HuggingFaceTB/SmolLM3-3B:hf-inference"  # example format from HF docs :contentReference[oaicite:4]{index=4}
+# Small chat/instruct model that works on HF Inference via router.
+HF_CHAT_MODEL = "HuggingFaceTB/SmolLM3-3B:hf-inference"
 
 PHASE1_PROMPT = """
 You are extracting data from a paramedic report. Return ONLY valid JSON.
@@ -36,7 +38,6 @@ def get_client(hf_token: str) -> OpenAI:
     hf_token = (hf_token or "").strip()
     if not hf_token:
         raise ValueError("Hugging Face token is missing (expected hf_...).")
-    # HF router is OpenAI-compatible :contentReference[oaicite:5]{index=5}
     return OpenAI(base_url=HF_BASE_URL, api_key=hf_token)
 
 # ==============================
@@ -188,11 +189,12 @@ def extract_phase1(file_input: Union[str, io.BytesIO], api_key: str) -> Dict[str
     for attempt in range(3):
         try:
             resp = client.chat.completions.create(
-                model=HF_CHAT_MODEL,  # model must include :hf-inference :contentReference[oaicite:6]{index=6}
+                model=HF_CHAT_MODEL,
                 messages=[
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0,
+                timeout=60,  # prevent long hangs
             )
 
             content = resp.choices[0].message.content or ""
@@ -285,7 +287,6 @@ REQUIRED OUTPUT FORMAT (JSON ONLY):
 }}
 """
 
-# Keep your “try models” behavior: first your chosen model, then a fallback.
 PHASE2_MODEL_CANDIDATES = [
     HF_CHAT_MODEL,
     "mistralai/Mistral-7B-Instruct-v0.3:hf-inference",
@@ -319,6 +320,7 @@ def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, An
                     model=m,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
+                    timeout=60,  # prevent long hangs
                 )
 
                 content = resp.choices[0].message.content or ""
