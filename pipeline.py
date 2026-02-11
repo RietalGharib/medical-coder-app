@@ -212,38 +212,122 @@ def extract_phase1(file_input: Union[str, io.BytesIO], api_key: str) -> Dict[str
 
     return {"ok": False, "data": None, "error": f"All attempts failed in Phase 1. Last error: {last_error}", "model_used": HF_CHAT_MODEL}
 
-# ==============================
-# 6) PHASE 2 (HF Router)
-# ==============================
+# ==================================
+# 6) PHASE 2: CODING AGENT (YOUR NEW VERSION, INTEGRATED)
+# ==================================
+PHASE2_PROMPT_TEMPLATE = """
+You are a professional Medical Coder.
+Your task is to assign ICD-10-CM codes based STRICTLY on the extracted text provided.
+Do not infer, assume, or reinterpret clinical meaning beyond what is explicitly documented.
+
+---
+SAFE ABBREVIATION REFERENCE GUIDE (UNAMBIGUOUS ONLY):
+The following abbreviations are guaranteed to be unambiguous in this context and may be safely interpreted:
+
+- "PVC" / "PVCs" → Premature Ventricular Contractions
+- "SOB" → Shortness of Breath
+- "SpO2" / "SPO2" → Oxygen saturation
+- "GCS" → Glasgow Coma Scale
+- "ECG" / "EKG" → Electrocardiogram
+- "IV" → Intravenous
+- "NS" → Normal saline
+- "ETCO2" → End-tidal carbon dioxide
+- "RR" → Respiratory rate
+- "HR" → Heart rate
+- "BP" → Blood pressure
+
+No other abbreviations may be expanded unless the full meaning is explicitly written in the text.
+
+---
+IMPORTANT SAFETY RULES (MANDATORY):
+
+1. NEVER expand ambiguous abbreviations (e.g., DOB, CP, BS, PT, RA, MI, OD).
+   - Do NOT guess their meaning from context.
+   - Do NOT code based on them unless the expanded meaning is explicitly written out.
+
+2. Do NOT infer qualifiers, severity, timing, or subtypes.
+   - Examples: "on exertion", "acute", "chronic", "with complication".
+   - These may ONLY be used if the exact wording appears in the text.
+
+3. Prefer conservative, unspecified symptom codes when documentation lacks specificity.
+   - Example: "chest discomfort" without further qualifiers → code as R07.4 (Chest pain, unspecified).
+
+4. Code ONLY what is clearly and explicitly documented.
+   - If documentation is vague or ambiguous, do NOT code it.
+
+5. If a condition is suspected, ruled out, or not confirmed,
+   code the presenting symptom — NOT the suspected diagnosis.
+
+---
+PATIENT DATA (JSON):
+{patient_data_json}
+
+---
+INSTRUCTIONS:
+
+1. Identify clinical findings, symptoms, and impressions exactly as written.
+2. Apply ONLY the SAFE abbreviation guide above.
+3. Assign the most accurate ICD-10-CM code supported by explicit text.
+4. Do NOT add, infer, or refine beyond documentation.
+
+---
+REQUIRED OUTPUT FORMAT (JSON ONLY):
+
+{{
+  "coding_results": [
+    {{
+      "icd10_code": "string (e.g., R07.4)",
+      "description": "string (official ICD-10 description)",
+      "source_text": "string (exact text snippet being coded)",
+      "reasoning": "string (why this code is supported by the text)"
+    }}
+  ]
+}}
+"""
+
+# Keep your “try models” behavior: first your chosen model, then a fallback.
+PHASE2_MODEL_CANDIDATES = [
+    HF_CHAT_MODEL,
+    "mistralai/Mistral-7B-Instruct-v0.3:hf-inference",
+]
+
+LLM_STATS: Dict[str, int] = {"phase2_calls": 0}
+
 def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, Any]:
+    """
+    Integrated Phase 2:
+    - Uses your prompt template exactly
+    - Tries models in order
+    - Returns Streamlit envelope like Phase 1
+    """
     try:
         client = get_client(api_key)
     except Exception as e:
         return {"ok": False, "data": None, "error": f"Client init failed: {e}", "model_used": None}
 
-    prompt = (
-        "You are a medical coding assistant.\n"
-        "Assign ICD-10 codes based on this JSON.\n"
-        "Return ONLY valid JSON. No markdown.\n"
-        "Schema: {\"coding_results\": [{\"icd10_code\":\"...\",\"description\":\"...\"}]}\n\n"
-        + json.dumps(phase1_data, ensure_ascii=False)
-        + "\n\nReturn JSON now:"
-    )
+    data_str = json.dumps(phase1_data, indent=2, ensure_ascii=False)
+    prompt = PHASE2_PROMPT_TEMPLATE.format(patient_data_json=data_str)
 
-    last_error: Optional[str] = None
+    last_err: Optional[str] = None
 
-    for attempt in range(3):
-        try:
-            resp = client.chat.completions.create(
-                model=HF_CHAT_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-            )
-            content = resp.choices[0].message.content or ""
-            data = _safe_json_loads(content)
-            return {"ok": True, "data": data, "error": None, "model_used": HF_CHAT_MODEL}
-        except Exception as e:
-            last_error = str(e)
-            _backoff_sleep(attempt)
+    for m in PHASE2_MODEL_CANDIDATES:
+        for attempt in range(3):
+            try:
+                LLM_STATS["phase2_calls"] += 1
 
-    return {"ok": False, "data": None, "error": f"All attempts failed in Phase 2. Last error: {last_error}", "model_used": HF_CHAT_MODEL}
+                resp = client.chat.completions.create(
+                    model=m,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                )
+
+                content = resp.choices[0].message.content or ""
+                data = _safe_json_loads(content)
+
+                return {"ok": True, "data": data, "error": None, "model_used": m}
+
+            except Exception as e:
+                last_err = f"model={m}, attempt={attempt+1}/3, error={e}"
+                _backoff_sleep(attempt)
+
+    return {"ok": False, "data": None, "error": f"Phase 2 failed. Last error: {last_err}", "model_used": None}
