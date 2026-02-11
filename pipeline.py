@@ -1,14 +1,3 @@
-Here is the fully updated and rewritten `pipeline.py`.
-
-This version includes:
-
-1. **The Fix for "Hanging":** It uses the robust `_safe_json_loads` that can handle conversational text without crashing the loop.
-2. **The Fix for the Crash:** It defines `LLM_STATS` globally so you don't get the `NameError`.
-3. **Optimized Phase 2:** It uses the "System" role and a shorter timeout (45s) to prevent stalling.
-
-You can replace your entire file with this code.
-
-```python
 # =========================
 # pipeline.py  (FULL REPLACEMENT)
 # =========================
@@ -381,5 +370,3 @@ def run_phase2_coding(phase1_data: Dict[str, Any], api_key: str) -> Dict[str, An
                     _backoff_sleep(attempt)
     
     return {"ok": False, "data": None, "error": f"Phase 2 failed after all models. Last error: {last_err}", "model_used": None}
-
-```
