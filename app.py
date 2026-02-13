@@ -1,84 +1,243 @@
 import streamlit as st
-import pipeline
 import os
 import json
+import asyncio
+import tempfile
+import logging
+from pypdf import PdfReader
+from PIL import Image
+from google import genai
+from google.genai import types
+from pydantic import BaseModel, Field, ValidationError, field_validator
+from typing import List, Optional, Dict, Any, Generic, TypeVar
 
-st.set_page_config(page_title="Paramedic AI Coder", page_icon="🚑", layout="wide")
+# ==============================
+# 1) CONFIG & LOGGING
+# ==============================
+st.set_page_config(page_title="MediCode AI", layout="wide", page_icon="🏥")
 
-st.title("🚑 Agentic Medical Coder")
-st.markdown("This tool processes medical PDFs and assigns ICD-10 codes using AI.")
+# Setup logging to show in console (Streamlit logs)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-with st.sidebar:
-    st.header("🔑 Configuration")
-    user_api_key = st.text_input("Enter Hugging Face API Token (hf_...)", type="password")
+# ==============================
+# 2) DATA MODELS (Your Existing Schema)
+# ==============================
+T = TypeVar("T")
 
-    st.caption("Tip: Create a Read token at https://huggingface.co/settings/tokens")
+class EvidenceField(BaseModel, Generic[T]):
+    value: Optional[T] = None
+    evidence: List[str] = Field(default_factory=list)
 
-    if not user_api_key:
-        st.warning("⚠️ You must enter a Hugging Face token to run the analysis.")
+class Vitals(BaseModel):
+    bp_systolic: Optional[EvidenceField[int]] = None
+    bp_diastolic: Optional[EvidenceField[int]] = None
+    pulse_rate: Optional[EvidenceField[int]] = None
+    ecg_rate: Optional[EvidenceField[int]] = None
+    spo2: Optional[EvidenceField[int]] = None
+
+    @field_validator("bp_systolic", "bp_diastolic", "pulse_rate", "ecg_rate", "spo2", mode="before")
+    @classmethod
+    def clean_numeric(cls, v):
+        if isinstance(v, dict) and "value" in v:
+            val = str(v.get("value") or "")
+            digits = "".join(ch for ch in val if ch.isdigit())
+            v["value"] = int(digits) if digits else None
+        return v
+
+class MedicationItem(BaseModel):
+    name: EvidenceField[str] = Field(default_factory=EvidenceField)
+    dose: EvidenceField[str] = Field(default_factory=EvidenceField)
+    route: EvidenceField[str] = Field(default_factory=EvidenceField)
+
+class ClinicalImpressionItem(BaseModel):
+    impression: EvidenceField[str] = Field(default_factory=EvidenceField)
+
+class ICD10Code(BaseModel):
+    icd10_code: str
+    description: str
+    source_text: str
+    reasoning: str
+
+class ICD10Result(BaseModel):
+    coding_results: List[ICD10Code] = Field(default_factory=list)
+
+class MedicalReport(BaseModel):
+    document_meta: Optional[Dict[str, Any]] = None
+    patient_info: Optional[Dict[str, Any]] = None
+    vitals: Optional[Vitals] = None
+    chief_complaint: Optional[EvidenceField[str]] = None
+    clinical_impression: List[ClinicalImpressionItem] = Field(default_factory=list)
+    medications_administered: List[MedicationItem] = Field(default_factory=list)
+    notes: Optional[EvidenceField[str]] = None
+    normalization: Optional[Dict[str, Any]] = None
+    coding: Optional[ICD10Result] = None
+
+# ==============================
+# 3) PROMPTS
+# ==============================
+PHASE1_PROMPT = """
+You are a Medical Data Extraction Specialist. Extract clinical data VERBATIM.
+
+1) SEMANTIC MAPPING (Vitals):
+   - 'bp_systolic' / 'bp_diastolic': Extract BP (e.g., 153/95).
+   - 'pulse_rate': Map labels like "Pulse", "HR", or "Mechanical Pulse". 
+   - 'ecg_rate': Map labels specifically like "ECG", "Monitor Rate", or "Electrical Rate".
+   - 'spo2': Map ALL variations: "SpO2", "SPo2", "SaO2", "%SaO2", "O2 Sat", "Pulse Ox".
+   - MULTI-VALUE: In a cell with two numbers (e.g., 83 77), use the label to pair them correctly.
+
+2) TABLE EXTRACTION:
+   - Identify "Medication Administered" and "Clinical Impression" tables.
+   - For Impressions, return: {"impression": {"value": "...", "evidence": [...]}}
+
+3) CLINICAL NARRATIVE:
+   - Extract narrative from "Notes". Filter out logistics (e.g., "mobility assessment").
+"""
+
+PHASE2_PROMPT_TEMPLATE = """
+You are a professional Medical Coder.
+Your task is to assign ICD-10-CM codes based STRICTLY on the extracted text provided.
+
+SAFE ABBREVIATIONS: PVC, SOB, SpO2, GCS, ECG, IV, NS, ETCO2, RR, HR, BP.
+RULES: Do not infer subtypes. Prefer conservative codes (e.g., R07.4 for chest discomfort).
+
+PATIENT DATA (JSON):
+{patient_data_json}
+
+REQUIRED OUTPUT FORMAT (JSON ONLY):
+{{
+  "coding_results": [
+    {{
+      "icd10_code": "string",
+      "description": "string",
+      "source_text": "string",
+      "reasoning": "string"
+    }}
+  ]
+}}
+"""
+
+# ==============================
+# 4) ASYNC PIPELINE LOGIC
+# ==============================
+async def run_pipeline(api_key, file_path, status_container):
+    client = genai.Client(api_key=api_key)
+    model_name = "gemini-2.0-flash-exp" # Or gemini-2.5-flash
+
+    try:
+        # --- PHASE 1: EXTRACTION ---
+        status_container.info("🚀 Phase 1: Extracting Clinical Data...")
+        
+        # Read text layer for cheap processing if possible
+        reader = PdfReader(file_path)
+        text_layer = "\n".join([p.extract_text() or "" for p in reader.pages])
+        
+        # Call Gemini (Async)
+        resp = await client.aio.models.generate_content(
+            model=model_name,
+            contents=[PHASE1_PROMPT, text_layer],
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
+        )
+        p1_raw = json.loads(resp.text)
+        
+        # --- PHASE 2: CODING ---
+        status_container.info("🧠 Phase 2: Assigning ICD-10 Codes...")
+        
+        prompt_p2 = PHASE2_PROMPT_TEMPLATE.format(patient_data_json=json.dumps(p1_raw))
+        resp_p2 = await client.aio.models.generate_content(
+            model=model_name,
+            contents=[prompt_p2],
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
+        )
+        p2_raw = json.loads(resp_p2.text)
+        
+        # Merge
+        p1_raw["coding"] = p2_raw
+        
+        # Validate
+        report = MedicalReport(**p1_raw)
+        status_container.success("✅ Processing Complete!")
+        
+        return report.model_dump(exclude_none=True)
+
+    except Exception as e:
+        status_container.error(f"Error: {str(e)}")
+        return None
+
+# ==============================
+# 5) STREAMLIT UI
+# ==============================
+def main():
+    st.title("🏥 MediCode AI: EMS to ICD-10")
+    st.markdown("Upload an EMS PDF report to extract clinical data and generate billing codes.")
+
+    # API Key Handling (Secrets or Input)
+    api_key = None
+    if "GOOGLE_API_KEY" in st.secrets:
+        api_key = st.secrets["GOOGLE_API_KEY"]
     else:
-        st.success("Token ready!")
+        api_key = st.text_input("Enter Google API Key:", type="password")
 
-uploaded_file = st.file_uploader("Upload Medical Report (PDF)", type=["pdf"])
+    uploaded_file = st.file_uploader("Upload Report (PDF)", type=["pdf"])
 
-if uploaded_file:
-    temp_dir = "temp_uploads"
-    os.makedirs(temp_dir, exist_ok=True)
-    file_path = os.path.join(temp_dir, uploaded_file.name)
+    if uploaded_file and api_key:
+        if st.button("Analyze Report"):
+            # Save to temp file because Google SDK needs a path or file-like object
+            # and it's safer to handle PDF libraries with a physical file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                tmp_file.write(uploaded_file.getvalue())
+                tmp_path = tmp_file.name
 
-    with open(file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+            try:
+                # Run Async Loop
+                status_box = st.empty()
+                result = asyncio.run(run_pipeline(api_key, tmp_path, status_box))
 
-    st.toast("File Uploaded Successfully", icon="✅")
+                if result:
+                    # --- DISPLAY RESULTS ---
+                    tab1, tab2, tab3 = st.tabs(["📄 ICD-10 Codes", "🩺 Clinical Data", "🔍 Raw JSON"])
 
-    if st.button("Run Analysis Pipeline", type="primary"):
-        if not user_api_key:
-            st.error("❌ Please enter your Hugging Face token in the sidebar first.")
-            st.stop()
+                    with tab1:
+                        st.subheader("Billing Codes")
+                        codes = result.get("coding", {}).get("coding_results", [])
+                        if codes:
+                            for c in codes:
+                                with st.expander(f"**{c.get('icd10_code')}** - {c.get('description')}"):
+                                    st.write(f"**Reasoning:** {c.get('reasoning')}")
+                                    st.caption(f"Source: \"{c.get('source_text')}\"")
+                        else:
+                            st.warning("No ICD-10 codes found.")
 
-        # --- PHASE 1 ---
-        with st.spinner("Phase 1: Extracting Clinical Data..."):
-            p1 = pipeline.extract_phase1(file_path, api_key=user_api_key)
+                    with tab2:
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.subheader("Vitals")
+                            vitals = result.get("vitals", {})
+                            st.metric("BP", f"{vitals.get('bp_systolic', {}).get('value')}/{vitals.get('bp_diastolic', {}).get('value')}")
+                            st.metric("Pulse", vitals.get('pulse_rate', {}).get('value'))
+                            st.metric("SpO2", f"{vitals.get('spo2', {}).get('value')}%")
+                        
+                        with col2:
+                            st.subheader("Impressions")
+                            imps = result.get("clinical_impression", [])
+                            for i in imps:
+                                st.info(i.get("impression", {}).get("value"))
 
-        if not p1["ok"]:
-            st.error(f"Phase 1 failed: {p1['error']}")
-            if p1.get("model_used"):
-                st.caption(f"Model attempted: {p1['model_used']}")
-            st.stop()
+                    with tab3:
+                        st.json(result)
+                        
+                    # Download Button
+                    st.download_button(
+                        label="Download JSON Report",
+                        data=json.dumps(result, indent=2),
+                        file_name="medical_report.json",
+                        mime="application/json"
+                    )
 
-        p1_data = p1["data"]
-        st.success("Phase 1 complete!")
-        st.caption(f"Model used: {p1.get('model_used')}")
+            finally:
+                # Cleanup temp file
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
-        with st.expander("View Extracted Data", expanded=False):
-            st.json(p1_data)
-
-        # --- PHASE 2 ---
-        with st.spinner("Phase 2: Assigning ICD-10 Codes..."):
-            p2 = pipeline.run_phase2_coding(p1_data, api_key=user_api_key)
-
-        if not p2["ok"]:
-            st.error(f"Phase 2 failed: {p2['error']}")
-            if p2.get("model_used"):
-                st.caption(f"Model attempted: {p2['model_used']}")
-            st.stop()
-
-        p2_data = p2["data"]
-        st.balloons()
-        st.success("Coding Complete!")
-        st.caption(f"Model used: {p2.get('model_used')}")
-
-        for item in p2_data.get("coding_results", []):
-            st.markdown(
-                f"""
-                <div style="background:#f0f2f6;padding:10px;border-radius:5px;border-left:4px solid #ff4b4b;margin-bottom:10px">
-                    <b>{item.get('icd10_code')}</b>: {item.get('description')}<br/>
-                    <small><b>Source:</b> {item.get('source_text','')}</small><br/>
-                    <small><b>Reasoning:</b> {item.get('reasoning','')}</small>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        full_report = json.dumps({"patient": p1_data, "coding": p2_data}, indent=2)
-        st.download_button("Download JSON", full_report, "report.json", "application/json")
+if __name__ == "__main__":
+    main()
