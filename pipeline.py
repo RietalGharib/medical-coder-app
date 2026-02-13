@@ -1,18 +1,54 @@
-from google import genai
-from google.genai import types
 import os
 import json
-from typing import Any, Dict, Optional, List, Tuple
-from pypdf import PdfReader
-from typing import Tuple
 import re
-from typing import Dict, List, Any, Tuple
+import asyncio
+import time
+import logging
+import hashlib
+from typing import Any, Dict, Optional, List, Tuple, Generic, TypeVar
 
-# Tier A: unambiguous EMS/clinical abbreviations (safe auto-expand)
+from pypdf import PdfReader
+from PIL import Image
+
+from google import genai
+from google.genai import types
+
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+# ==============================
+# 0) LOGGING CONFIGURATION
+# ==============================
+# DEV: logging.DEBUG  (shows more, but still PHI-safe)
+# PROD: logging.INFO  (minimal)
+LOG_LEVEL = logging.DEBUG
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+# ==============================
+# 1) SECURITY
+# ==============================
+API_KEY = "AIzaSyAgbfrTiVk7x-_EJl0yiHeDGAJ7Fx4NS4M"
+
+# ==============================
+# 2) CONFIGURATION
+# ==============================
+DEFAULT_MODEL_CANDIDATES = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash-exp",
+]
+
+MAX_CONCURRENT_REQUESTS = 5
+
+# Tier A: safe expansions only
 TIER_A_ABBREVIATIONS: Dict[str, str] = {
     "SOB": "shortness of breath",
     "SPO2": "oxygen saturation",
-    "SpO2": "oxygen saturation",  # handle common casing
+    "SpO2": "oxygen saturation",
     "GCS": "Glasgow Coma Scale",
     "ECG": "electrocardiogram",
     "EKG": "electrocardiogram",
@@ -26,15 +62,19 @@ TIER_A_ABBREVIATIONS: Dict[str, str] = {
     "BP": "blood pressure",
 }
 
-_ABBR_PATTERN = re.compile(r"\b[A-Za-z][A-Za-z0-9]{1,6}s?\b")  # catches SOB, PVCs, SpO2, etc.
+_ABBR_PATTERN = re.compile(r"\b[A-Za-z][A-Za-z0-9]{1,6}s?\b")
 
+
+def safe_job_id(file_path: str) -> str:
+    """PHI-safe job id: derived hash, no filename leakage."""
+    h = hashlib.sha256(file_path.encode("utf-8")).hexdigest()[:10]
+    return f"job_{h}"
+
+
+# ==============================
+# 3) TEXT NORMALIZATION (SAFE)
+# ==============================
 def expand_tier_a_shorthand(text: str) -> Tuple[str, List[Dict[str, str]]]:
-    """
-    Safe expansion:
-    - Only expands Tier-A abbreviations.
-    - Returns (expanded_text, expansions_metadata)
-    - Does NOT guess. Unknown tokens are ignored.
-    """
     if not text:
         return text, []
 
@@ -42,7 +82,6 @@ def expand_tier_a_shorthand(text: str) -> Tuple[str, List[Dict[str, str]]]:
 
     def repl(match: re.Match) -> str:
         token = match.group(0)
-        # check exact token then uppercase token
         if token in TIER_A_ABBREVIATIONS:
             full = TIER_A_ABBREVIATIONS[token]
         elif token.upper() in TIER_A_ABBREVIATIONS:
@@ -51,191 +90,265 @@ def expand_tier_a_shorthand(text: str) -> Tuple[str, List[Dict[str, str]]]:
             return token
 
         expansions.append({"abbr": token, "expanded": full})
-        # Add expansion without deleting original token (safest)
         return f"{token} ({full})"
 
     expanded = _ABBR_PATTERN.sub(repl, text)
     return expanded, expansions
 
+
+# ==============================
+# 4) PDF TEXT EXTRACTION
+# ==============================
 def extract_pdf_text_layer(file_path: str) -> Tuple[str, float]:
     """
-    Extract embedded text from a PDF and return (text, quality_score 0..1).
-    quality_score is a heuristic: higher = likely a clean text-layer PDF.
+    Returns: (text, quality_score 0..1)
     """
-    reader = PdfReader(file_path)
-    pages_text = []
-    total_chars = 0
-    printable_chars = 0
+    try:
+        reader = PdfReader(file_path)
+        pages_text = []
+        total_chars = 0
+        printable_chars = 0
 
-    for page in reader.pages:
-        t = page.extract_text() or ""
-        pages_text.append(t)
+        for page in reader.pages:
+            t = page.extract_text() or ""
+            pages_text.append(t)
+            total_chars += len(t)
+            printable_chars += sum(1 for ch in t if ch.isprintable() and not ch.isspace())
 
-        total_chars += len(t)
-        printable_chars += sum(1 for ch in t if ch.isprintable() and not ch.isspace())
+        text = "\n\n--- PAGE BREAK ---\n\n".join(pages_text).strip()
 
-    text = "\n\n--- PAGE BREAK ---\n\n".join(pages_text).strip()
+        if total_chars == 0:
+            return "", 0.0
 
-    if total_chars == 0:
+        density = printable_chars / max(total_chars, 1)
+        length_ok = 1.0 if total_chars > 1500 else total_chars / 1500.0
+        quality = 0.6 * density + 0.4 * length_ok
+        return text, max(0.0, min(1.0, quality))
+
+    except Exception as e:
+        logger.error(f"PDF read failed: {type(e).__name__}")
         return "", 0.0
 
-    # Heuristics:
-    density = printable_chars / max(total_chars, 1)          # 0..1
-    length_ok = 1.0 if total_chars > 1500 else total_chars / 1500.0
-    quality = 0.6 * density + 0.4 * length_ok               # 0..1
-
-    return text, max(0.0, min(1.0, quality))
 
 # ==============================
-# 0) SECURITY: BRUTE FORCE (TEMPORARY)
+# 5) GEMINI CLIENT
 # ==============================
-# PASTE YOUR REAL KEY INSIDE THE QUOTES BELOW
-API_KEY = "AIzaSyD5_PASTE_YOUR_FULL_REAL_KEY_HERE" 
-
-from google import genai
-# ... rest of imports ...
-
-def get_client():
-    return genai.Client(api_key=API_KEY)
-
-# ---- DEBUG / COST VISIBILITY ----
-LLM_STATS = {
-"phase1_calls": 0,
-"phase1_mode_vision": 0,
-"phase1_mode_text": 0,
-"phase2_calls": 0,
-}
-
-DEFAULT_MODEL_CANDIDATES = [
-    
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-]
-
-# ==================================
-# 1) CLIENT + MODEL SELECTION
-# ==================================
 def get_client() -> genai.Client:
     return genai.Client(api_key=API_KEY)
 
+
 def choose_model(client: genai.Client, candidates: List[str]) -> List[str]:
-    """Returns an ordered list of models to try (best effort)."""
     try:
         available = []
         for m in client.models.list():
             name = getattr(m, "name", "") or ""
             available.append(name.split("/")[-1])
-
         ordered = [c for c in candidates if c in available]
         return ordered if ordered else candidates
     except Exception:
         return candidates
 
-# ==================================
-# 2) PHASE 1 PROMPT (FULL DOCUMENT)
-# ==================================
+
+# ==============================
+# 6) PYDANTIC MODELS
+# ==============================
+T = TypeVar("T")
+
+
+class EvidenceField(BaseModel, Generic[T]):
+    value: Optional[T] = None
+    evidence: List[str] = Field(default_factory=list)
+
+
+class DocumentMeta(BaseModel):
+    source_file: Optional[str] = None
+    page_count: Optional[int] = None
+
+
+class PatientInfo(BaseModel):
+    patient_id: Optional[EvidenceField[str]] = None
+    first_name: Optional[EvidenceField[str]] = None
+    surname: Optional[EvidenceField[str]] = None
+
+
+class Vitals(BaseModel):
+    bp_systolic: Optional[EvidenceField[int]] = None
+    bp_diastolic: Optional[EvidenceField[int]] = None
+    pulse_rate: Optional[EvidenceField[int]] = None
+    ecg_rate: Optional[EvidenceField[int]] = None
+    spo2: Optional[EvidenceField[int]] = None
+
+    # This validator ensures strings like "153 mmHg" become the integer 153
+    @field_validator("bp_systolic", "bp_diastolic", "pulse_rate", "ecg_rate", "spo2", mode="before")
+    @classmethod
+    def clean_numeric(cls, v):
+        if isinstance(v, dict) and "value" in v:
+            val = str(v.get("value") or "")
+            digits = "".join(ch for ch in val if ch.isdigit())
+            v["value"] = int(digits) if digits else None
+        return v
+
+    @field_validator("spo2")
+    @classmethod
+    def validate_spo2(cls, v):
+        if isinstance(v, dict) and v.get("value") is not None:
+            if not (0 <= v["value"] <= 100):
+                v["value"] = None
+                v["evidence"] = []
+        return v
+
+    @field_validator("pulse_rate", "ecg_rate")
+    @classmethod
+    def validate_rates(cls, v):
+        if isinstance(v, dict) and v.get("value") is not None:
+            if not (20 <= v["value"] <= 250):
+                v["value"] = None
+                v["evidence"] = []
+        return v
+
+    @field_validator("bp_systolic")
+    @classmethod
+    def validate_sys(cls, v):
+        if isinstance(v, dict) and v.get("value") is not None:
+            if not (60 <= v["value"] <= 260):
+                v["value"] = None
+                v["evidence"] = []
+        return v
+
+    @field_validator("bp_diastolic")
+    @classmethod
+    def validate_dia(cls, v):
+        if isinstance(v, dict) and v.get("value") is not None:
+            if not (30 <= v["value"] <= 180):
+                v["value"] = None
+                v["evidence"] = []
+        return v
+
+
+class ChiefComplaint(BaseModel):
+    text: Optional[EvidenceField[str]] = None
+
+
+class Notes(BaseModel):
+    raw_text: Optional[EvidenceField[str]] = None
+
+
+class MedicationItem(BaseModel):
+    # Matches the updated prompt schema
+    name: EvidenceField[str] = Field(default_factory=EvidenceField)
+    dose: EvidenceField[str] = Field(default_factory=EvidenceField)
+    route: EvidenceField[str] = Field(default_factory=EvidenceField)
+
+class ClinicalImpressionItem(BaseModel):
+    # Fixed nesting: use 'impression' instead of 'value'
+    impression: EvidenceField[str] = Field(default_factory=EvidenceField)
+
+
+class MedicalReport(BaseModel):
+    document_meta: Optional[DocumentMeta] = None
+    patient_info: Optional[PatientInfo] = None
+    vitals: Optional[Vitals] = None
+    chief_complaint: Optional[ChiefComplaint] = None
+    clinical_impression: List[ClinicalImpressionItem] = Field(default_factory=list)
+    medications_administered: List[MedicationItem] = Field(default_factory=list)
+    notes: Optional[Notes] = None
+    normalization: Optional[Dict[str, Any]] = None
+
+
+# ==============================
+# 7) PHASE 1 PROMPT (SAFER)
+# ==============================
 PHASE1_PROMPT = """
-You are extracting data from a paramedic report (image/PDF). Your job is Phase 1 ONLY:
-- Read the document as-is.
-- Produce a faithful JSON representation of the visible fields and tables.
-- Do NOT infer diagnoses or add medical interpretations.
-- Do NOT convert symptoms into ICD-10.
+You are a Medical Data Extraction Specialist. 
+Your goal is to extract clinical data VERBATIM, regardless of the document layout.
 
-Rules:
-1) Return ONLY valid JSON. No markdown, no commentary.
-2) Every extracted field MUST include evidence: a list of exact text snippets copied from the document.
-3) If something is unclear/ambiguous, include raw text, confidence, and add a quality_flag.
+STRICT EXTRACTION RULES:
 
-Schema (return exactly these top-level keys, even if empty lists/nulls):
+1) SEMANTIC MAPPING (Vitals):
+   - 'bp_systolic': The first/top number in Blood Pressure (e.g., 153).
+   - 'bp_diastolic': The second/bottom number in Blood Pressure (e.g., 95).
+   - 'pulse_rate': Physical pulse/HR labels.
+   - 'ecg_rate': Electrical/Monitor ECG labels.
+   - 'spo2': Oxygen saturation (%SaO2).
+   - 'spo2': Search for values associated with oxygen saturation labels. 
+     This includes all variations such as: "SpO2", "SPo2", "SaO2", "%SaO2", "O2 Sat" or "Pulse Ox" when located near respiratory data.
+
+2) TABLE EXTRACTION (Medications & Impressions):
+   - Identify any section or table containing "Medication", "Drugs", or "Administered". 
+   - For each entry, extract the Name, Dosage, and Route.
+   - Identify any section containing "Impression", "Assessment", or "Diagnosis". Extract these as a list.
+   - Return JSON file only.
+
+3) CLINICAL NARRATIVE (Notes):
+   - Locate the main narrative section (often labeled "Notes", "History of Present Illness", or "Narrative").
+   - Extract the clinical story. 
+   - FILTER: Exclude administrative or logistical phrases (e.g., "Consent obtained", "Arrived at destination", "Mobility assessment").
+
+4) DATA INTEGRITY:
+   - If a field is missing, set value to null.
+   - EVIDENCE: For every field, capture the exact snippet of text + the surrounding labels to prove the context.
+
+Schema:
 {
-  "document_meta": {
-    "source_file": "string",
-    "page_count": "int|null",
-    "printed_datetime": { "value": "string|null", "evidence": ["..."], "confidence": "high|medium|low" }
-  },
+  "document_meta": { "source_file": "string", "page_count": "int" },
   "patient_info": {
-    "patient_id": { "value": "string|null", "evidence": ["..."], "confidence": "high|medium|low" },
-    "first_name": { "value": "string|null", "evidence": ["..."], "confidence": "high|medium|low" },
-    "surname": { "value": "string|null", "evidence": ["..."], "confidence": "high|medium|low" },
-    "date_of_birth": { "value": "string|null", "evidence": ["..."], "confidence": "high|medium|low" },
-    "age_years": { "value": "int|null", "raw": "string|null", "evidence": ["..."], "confidence": "high|medium|low" },
-    "gender": { "value": "string|null", "evidence": ["..."], "confidence": "high|medium|low" }
-  },
-  "chief_complaint": {
-    "text": { "value": "string|null", "evidence": ["..."], "confidence": "high|medium|low" }
+      "patient_id": { "value": "string", "evidence": [] },
+      "first_name": { "value": "string", "evidence": [] },
+      "surname": { "value": "string", "evidence": [] }
   },
   "vitals": {
-    "bp_systolic": { "value": "int|null", "evidence": ["..."], "confidence": "high|medium|low" },
-    "bp_diastolic": { "value": "int|null", "evidence": ["..."], "confidence": "high|medium|low" },
-    "pulse_rate": { "value": "int|null", "evidence": ["..."], "confidence": "high|medium|low" },
-    "spo2": { "value": "int|null", "evidence": ["..."], "confidence": "high|medium|low" },
-    "gcs_total": { "value": "int|null", "evidence": ["..."], "confidence": "high|medium|low" }
+    "pulse_rate": { "value": "int", "evidence": [] },
+    "ecg_rate": { "value": "int", "evidence": [] },
+    "spo2": { "value": "int", "evidence": [] },
+    "bp_systolic": { "value": "int", "evidence": [] },
+    "bp_diastolic": { "value": "int", "evidence": [] }
   },
-  "clinical_impression": [
-    { "system": "string", "impression": "string", "evidence": ["..."], "confidence": "high|medium|low" }
-  ],
+  "clinical_impression": [{"impression": {"value": "string", "evidence": []}}],
   "medications_administered": [
-    { "medication": { "value": "string", "evidence": ["..."], "confidence": "high|medium|low" } }
+    {"name": {"value": "string", "evidence": []}, "dose": {"value": "string", "evidence": []}, "route": {"value": "string", "evidence": []}}
   ],
-  "notes": {
-    "raw_text": { "value": "string|null", "evidence": ["..."], "confidence": "high|medium|low" }
-  },
-  "symptoms_reported": [
-    { "text": "string", "evidence": ["..."], "confidence": "high|medium|low" }
-  ]
+  "notes": { "raw_text": { "value": "string", "evidence": [] } }
 }
-Important: Use null when absent; do not invent.
 """
 
-# ==================================
-# 3) PHASE 1 GENERATION
-# ==================================
-# ==================================
-# 3) PHASE 1 GENERATION
-# ==================================
-def generate_phase1_json_text(
-    client: genai.Client,
-    models: List[str],
-    file_path: str
+
+# ==============================
+# 8) PHASE 1 GENERATION (ASYNC)
+# ==============================
+async def generate_phase1_json_text_async(
+        client: genai.Client,
+        models: List[str],
+        file_path: str
 ) -> Optional[str]:
-    last_err = None
 
-    # Decide how we will feed content to the model
+    pdf_text = None
+    mode = "vision"
+
     if file_path.lower().endswith(".pdf"):
-        pdf_text, quality = extract_pdf_text_layer(file_path)
-        print(f"[Router] PDF text-layer quality={quality:.2f} chars={len(pdf_text)}")
+        pdf_text_tmp, quality = await asyncio.to_thread(extract_pdf_text_layer, file_path)
 
-        # NEW: if text layer is good, do cheaper text-only Phase 1
-        if quality >= 0.70 and len(pdf_text) >= 800:
+        # DEBUG ONLY (no PHI)
+        logger.debug(f"[Router] quality={quality:.2f} chars={len(pdf_text_tmp)}")
+
+        if quality >= 0.70 and len(pdf_text_tmp) >= 800:
+            pdf_text = pdf_text_tmp
             contents = [PHASE1_PROMPT + "\n\n---\nPDF TEXT LAYER (verbatim):\n" + pdf_text]
-            phase1_mode = "text"
+            mode = "text"
         else:
-            uploaded = client.files.upload(file=file_path)
+            uploaded = await asyncio.to_thread(client.files.upload, file=file_path)
             contents = [uploaded, PHASE1_PROMPT]
-            phase1_mode = "vision"
-
+            mode = "vision"
     else:
-        from PIL import Image
-        img = Image.open(file_path)
+        img = await asyncio.to_thread(Image.open, file_path)
         contents = [img, PHASE1_PROMPT]
-        phase1_mode = "vision"
+        mode = "vision"
 
-    # Try models in order
     for m in models:
         try:
-            print(f"🚀 Phase 1: Extraction using model: {m}")
+            # INFO safe (no filename)
+            logger.info(f"🚀 Phase 1 extraction ({mode}) using {m}")
 
-            # Cost visibility
-            LLM_STATS["phase1_calls"] += 1
-            if phase1_mode == "text":
-                LLM_STATS["phase1_mode_text"] += 1
-            else:
-                LLM_STATS["phase1_mode_vision"] += 1
-
-            print(f"[LLM] Phase 1 call #{LLM_STATS['phase1_calls']} ({phase1_mode}) model={m}")
-
-            resp = client.models.generate_content(
+            resp = await client.aio.models.generate_content(
                 model=m,
                 contents=contents,
                 config=types.GenerateContentConfig(
@@ -246,48 +359,64 @@ def generate_phase1_json_text(
             return resp.text
 
         except Exception as e:
-            last_err = e
-            print(f"⚠️ Failed on {m}: {e}")
+            logger.warning(f"⚠️ Model failed: {m} ({type(e).__name__})")
 
-    print(f"❌ All models failed. Last error: {last_err}")
     return None
 
+
+# ==============================
+# 9) POST-CLEANUP
+# ==============================
 def beautify_phase1(obj: Dict[str, Any]) -> Dict[str, Any]:
-    """Basic cleanup to ensure consistent structure."""
     obj = dict(obj)
-    vitals = obj.get("vitals", {})
-    if "heart_rate" in vitals and "pulse_rate" not in vitals:
-        vitals["pulse_rate"] = vitals.pop("heart_rate")
+    vitals = obj.get("vitals") or {}
+
+    # Explicitly initialize all fields to prevent 'KeyError' or missing keys
+    required_vitals = ["bp_systolic", "bp_diastolic", "pulse_rate", "ecg_rate", "spo2"]
+    for v in required_vitals:
+        vitals.setdefault(v, {"value": None, "evidence": []})
+
     obj["vitals"] = vitals
     return obj
+
+
+def normalize_schema(p1: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(p1)
+
+    # Ensure clinical_impression is always a list of correctly formatted objects
+    cis = out.get("clinical_impression") or []
+    normalized_cis = []
+
+    if isinstance(cis, list):
+        for item in cis:
+            if isinstance(item, dict) and "impression" in item:
+                # If it already matches {"impression": {"value": ...}}
+                normalized_cis.append(item)
+            elif isinstance(item, str):
+                # Fallback if the AI returns a simple string
+                normalized_cis.append({
+                    "impression": {"value": item, "evidence": []}
+                })
+
+    out["clinical_impression"] = normalized_cis
+    return out
+
+def drop_impression_headers(p1: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(p1)
+    headers = {"respiratory", "cardiac", "neuro", "neurological", "gi", "msk", "general"}
+    cleaned = []
+    for item in out.get("clinical_impression", []) or []:
+        val = (((item or {}).get("impression") or {}).get("value") or "").strip().lower()
+        if val and val not in headers:
+            cleaned.append(item)
+    out["clinical_impression"] = cleaned
+    return out
+
 def apply_phase1_5_normalization(p1: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Returns a COPY of Phase-1 JSON with additive normalization fields.
-    Raw evidence + original values remain unchanged.
-    """
-    out = dict(p1)  # shallow copy
+    out = dict(p1)
+    normalization = {"tier_a_expansions": [], "normalized_fields": {}}
 
-    normalization = {
-        "tier_a_expansions": [],
-        "normalized_fields": {}
-    }
-
-    # Normalize specific text-bearing fields safely
-    # 1) chief complaint
-    try:
-        cc = (out.get("chief_complaint") or {}).get("text") or {}
-        cc_val = cc.get("value")
-        if isinstance(cc_val, str) and cc_val.strip():
-            expanded, exps = expand_tier_a_shorthand(cc_val)
-            if exps:
-                normalization["tier_a_expansions"].extend(
-                    [{"field": "chief_complaint.text", **e} for e in exps]
-                )
-                normalization["normalized_fields"]["chief_complaint.text"] = expanded
-    except Exception:
-        pass
-
-    # 2) notes raw text
+    # notes
     try:
         notes = (out.get("notes") or {}).get("raw_text") or {}
         notes_val = notes.get("value")
@@ -301,58 +430,14 @@ def apply_phase1_5_normalization(p1: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 3) clinical impressions
-    try:
-        cis = out.get("clinical_impression") or []
-        if isinstance(cis, list):
-            normalized_cis = []
-            for idx, item in enumerate(cis):
-                item = dict(item)
-                imp = item.get("impression")
-                if isinstance(imp, str) and imp.strip():
-                    expanded, exps = expand_tier_a_shorthand(imp)
-                    if exps:
-                        normalization["tier_a_expansions"].extend(
-                            [{"field": f"clinical_impression[{idx}].impression", **e} for e in exps]
-                        )
-                        item["impression_normalized"] = expanded  # additive field
-                normalized_cis.append(item)
-            out["clinical_impression"] = normalized_cis
-    except Exception:
-        pass
-
-    # Attach normalization metadata
     out["normalization"] = normalization
     return out
-def extract_phase1(file_path: str) -> Optional[Dict[str, Any]]:
-    client = get_client()
-    if not os.path.exists(file_path):
-        print(f"❌ File not found: {file_path}")
-        return None
 
-    models = choose_model(client, DEFAULT_MODEL_CANDIDATES)
-    json_text = generate_phase1_json_text(client, models, file_path)
-    if not json_text:
-        return None
 
-    try:
-        raw_obj = json.loads(json_text)
 
-        # Phase 1 cleanup
-        p1 = beautify_phase1(raw_obj)
-
-        # ⬇️ THIS IS THE EXACT LINE YOU ADD
-        p1 = apply_phase1_5_normalization(p1)
-
-        return p1
-
-    except json.JSONDecodeError:
-        print("❌ Invalid JSON returned by model.")
-        return None
-
-# ==================================
-# 4) PHASE 2: CODING AGENT (NEW)
-# ==================================
+# ==============================
+# 9.5) PHASE 2 (ICD-10 CODING)
+# ==============================
 PHASE2_PROMPT_TEMPLATE = """
 You are a professional Medical Coder.
 Your task is to assign ICD-10-CM codes based STRICTLY on the extracted text provided.
@@ -363,7 +448,7 @@ SAFE ABBREVIATION REFERENCE GUIDE (UNAMBIGUOUS ONLY):
 The following abbreviations are guaranteed to be unambiguous in this context and may be safely interpreted:
 
 - "PVC" / "PVCs" → Premature Ventricular Contractions
-- "SOB" → Shortness of Breath
+- "SOB" → Short Of Breath
 - "SpO2" / "SPO2" → Oxygen saturation
 - "GCS" → Glasgow Coma Scale
 - "ECG" / "EKG" → Electrocardiogram
@@ -423,75 +508,150 @@ REQUIRED OUTPUT FORMAT (JSON ONLY):
 }}
 """
 
-def run_phase2_coding(phase1_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    client = get_client()
-    models = choose_model(client, DEFAULT_MODEL_CANDIDATES)
 
-    # Prepare data for prompt
-    data_str = json.dumps(phase1_data, indent=2)
+async def run_phase2_coding_async(
+    client: genai.Client,
+    models: List[str],
+    phase1_data: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    Runs ICD-10 coding using the SAME client/models as Phase 1.
+    Returns parsed JSON dict or None.
+    """
+    # Keep your logic: dump JSON into prompt
+    data_str = json.dumps(phase1_data, indent=2, ensure_ascii=False)
     prompt = PHASE2_PROMPT_TEMPLATE.format(patient_data_json=data_str)
 
-    print("\n🧠 Phase 2: Analyzing symptoms & Assigning Codes...")
+    last_err: Optional[Exception] = None
 
-    last_err = None
     for m in models:
         try:
-            LLM_STATS["phase2_calls"] += 1
-            print(f"[LLM] Phase 2 call #{LLM_STATS['phase2_calls']} model={m}")
-            resp = client.models.generate_content(
+            logger.info(f"🧠 Phase 2 coding using {m}")
+            resp = await client.aio.models.generate_content(
                 model=m,
                 contents=[prompt],
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    temperature=0.0
-                )
+                    temperature=0.0,
+                ),
             )
+            # resp.text should be JSON due to response_mime_type
             return json.loads(resp.text)
+
         except Exception as e:
             last_err = e
-            print(f"⚠️ Phase 2 failed on {m}: {e}")
-            
-    print(f"❌ Phase 2 failed. Last error: {last_err}")
+            logger.warning(f"⚠️ Phase 2 failed on {m}: {type(e).__name__}")
+
+    logger.error(f"❌ Phase 2 failed. Last error: {type(last_err).__name__ if last_err else 'Unknown'}")
     return None
 
-# ==================================
-# 5) MAIN EXECUTION PIPELINE
-# ==================================
+
+
+
+
+# ==============================
+# 10) SINGLE FILE PROCESSOR
+# ==============================
+async def process_single_file(
+        file_path: str,
+        sem: asyncio.Semaphore,
+        client: genai.Client,
+        models: List[str]
+) -> Optional[Dict[str, Any]]:
+
+    job_id = safe_job_id(file_path)
+
+    async with sem:
+        if not os.path.exists(file_path):
+            logger.error(f"{job_id}: file missing")
+            return None
+
+        json_text = await generate_phase1_json_text_async(client, models, file_path)
+        if not json_text:
+            logger.error(f"{job_id}: phase1 failed")
+            return None
+
+        try:
+            raw_obj = json.loads(json_text)
+
+            p1 = beautify_phase1(raw_obj)
+            p1 = normalize_schema(p1)
+            p1 = drop_impression_headers(p1)
+            p1 = apply_phase1_5_normalization(p1)
+
+            validated = MedicalReport(**p1)
+
+            # DEBUG only, still PHI safe (no patient_info)
+            logger.debug(f"{job_id}: validated successfully")
+
+            phase1_out = validated.model_dump(exclude_none=True)
+
+            # --- Phase 2: ICD-10 coding ---
+            phase2_out = await run_phase2_coding_async(client, models, phase1_out)
+
+            if phase2_out:
+                # attach results without changing Phase 1 structure
+                phase1_out["icd10_coding"] = phase2_out.get("coding_results", [])
+                phase1_out["icd10_coding_raw"] = phase2_out  # optional but useful
+
+            return phase1_out
+
+        except ValidationError as e:
+            # PHI safe: only show error locations/messages
+            safe_errors = [(err.get("loc"), err.get("msg")) for err in e.errors()]
+            logger.error(f"{job_id}: validation error {safe_errors}")
+            return None
+
+        except json.JSONDecodeError:
+            logger.error(f"{job_id}: invalid JSON")
+            return None
+
+
+# ==============================
+# 11) BATCH RUNNER
+# ==============================
+async def run_batch_job(file_paths: List[str]) -> List[Dict[str, Any]]:
+    client = get_client()
+    models = choose_model(client, DEFAULT_MODEL_CANDIDATES)
+    sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+    start_time = time.perf_counter()
+    logger.info(f"Starting batch of {len(file_paths)} files...")
+
+    tasks = [process_single_file(fp, sem, client, models) for fp in file_paths]
+    results = await asyncio.gather(*tasks)
+
+    end_time = time.perf_counter()
+    valid = [r for r in results if r is not None]
+
+    logger.info("=" * 55)
+    logger.info(f"✅ BATCH COMPLETE in {end_time - start_time:.2f}s")
+    logger.info(f"📄 Success: {len(valid)}/{len(file_paths)}")
+    logger.info("=" * 55)
+
+    return valid
+
+
+# ==============================
+# 12) TESTING BLOCK
+# ==============================
 if __name__ == "__main__":
-    # Update with your actual file path
-    TARGET_FILE = r"C:\Users\rieta\OneDrive\Desktop\medical_ocr\WWD2YWN-A-U49.pdf"
+    test_file_path = r"C:\Users\rieta\OneDrive\Desktop\medical_ocr\WWD2YWN-A-U49.pdf"
 
-    print(f"🚀 STARTING PIPELINE for {TARGET_FILE}")
-
-    # --- STEP 1: EXTRACT ---
-    p1_result = extract_phase1(TARGET_FILE)
-
-    if p1_result:
-        print("\n✅ PHASE 1 COMPLETE")
-        # Save Phase 1
-        with open("phase1_extracted.json", "w", encoding="utf-8") as f:
-            json.dump(p1_result, f, indent=2, ensure_ascii=False)
-        
-        # --- STEP 2: CODE ---
-        p2_result = run_phase2_coding(p1_result)
-        
-        if p2_result:
-            print("\n✅ PHASE 2 COMPLETE")
-            print(json.dumps(p2_result, indent=2))
-            
-            # Save Phase 2
-            with open("phase2_coded.json", "w", encoding="utf-8") as f:
-                json.dump(p2_result, f, indent=2, ensure_ascii=False)
-
-            # --- STEP 3: FINAL MERGE ---
-            final_report = {
-                "patient_summary": p1_result,
-                "icd10_coding": p2_result.get("coding_results", [])
-            }
-            with open("final_medical_report.json", "w", encoding="utf-8") as f:
-                json.dump(final_report, f, indent=2, ensure_ascii=False)
-                print("\n💾 FINAL REPORT SAVED: final_medical_report.json")
-        else:
-            print("❌ Phase 2 Failed.")
+    if "PASTE_YOUR_KEY_HERE" in API_KEY:
+        logger.critical("API Key is missing!")
+    elif not os.path.exists(test_file_path):
+        logger.critical("Test file not found.")
     else:
-        print("❌ Phase 1 Failed.")
+        batch_files = [test_file_path]
+
+        final_data = asyncio.run(run_batch_job(batch_files))
+
+        if final_data:
+            output_name = "batch_results.json"
+            with open(output_name, "w", encoding="utf-8") as f:
+                json.dump(final_data, f, indent=2, ensure_ascii=False)
+
+            logger.info(f"Results saved to disk: {output_name}")
+
+
