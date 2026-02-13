@@ -122,7 +122,7 @@ REQUIRED OUTPUT FORMAT (JSON ONLY):
 # ==============================
 async def run_pipeline(api_key, file_path, status_container):
     client = genai.Client(api_key=api_key)
-    model_name = "gemini-2.0-flash-exp" # Or gemini-2.5-flash
+    model_name = "gemini-2.5-flash-exp" # Or gemini-2.0-flash
 
     try:
         # --- PHASE 1: EXTRACTION ---
@@ -241,3 +241,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
