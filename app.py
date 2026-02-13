@@ -4,16 +4,13 @@ import tempfile
 import streamlit as st
 import asyncio
 
-# ✅ import your pipeline (the fixed one)
-import pipeline
+import pipeline  # your fixed pipeline.py in same folder
 
 st.set_page_config(page_title="MediCode AI", layout="wide", page_icon="🏥")
 
 def run_async(coro):
     """
     Streamlit-safe async runner.
-    - If no running loop: asyncio.run
-    - If loop exists (some environments): create task and wait
     """
     try:
         loop = asyncio.get_running_loop()
@@ -21,26 +18,23 @@ def run_async(coro):
         loop = None
 
     if loop and loop.is_running():
-        # Fallback: run in a new loop via asyncio.run in a thread-like approach
-        # simplest reliable approach for Streamlit:
+        # In many Streamlit environments, asyncio.run is still OK here.
         return asyncio.run(coro)
-    else:
-        return asyncio.run(coro)
+    return asyncio.run(coro)
 
 def main():
     st.title("🏥 MediCode AI: EMS to ICD-10")
     st.markdown("Upload an EMS PDF report to extract clinical data and generate billing codes.")
 
-    # ✅ Use one key name everywhere
+    # ---- API KEY (Secrets -> env var) ----
     api_key = None
     if "GEMINI_API_KEY" in st.secrets:
         api_key = st.secrets["GEMINI_API_KEY"]
     else:
         api_key = st.text_input("Enter Gemini API Key:", type="password")
 
-    # Put key where pipeline expects it
     if api_key:
-        os.environ["GEMINI_API_KEY"] = api_key
+        os.environ["GEMINI_API_KEY"] = api_key  # ✅ this is what pipeline.py needs
 
     uploaded_file = st.file_uploader("Upload Report (PDF)", type=["pdf"])
 
@@ -55,7 +49,6 @@ def main():
             try:
                 status_box.info("🚀 Running extraction + coding pipeline...")
 
-                # ✅ Call pipeline (which includes normalization + validation + phase2)
                 results = run_async(pipeline.run_batch_job([tmp_path]))
 
                 if not results:
@@ -65,7 +58,6 @@ def main():
                 result = results[0]
                 status_box.success("✅ Processing Complete!")
 
-                # --- DISPLAY RESULTS ---
                 tab1, tab2, tab3 = st.tabs(["📄 ICD-10 Codes", "🩺 Clinical Data", "🔍 Raw JSON"])
 
                 with tab1:
@@ -117,6 +109,9 @@ def main():
             finally:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
+
+    elif uploaded_file and not api_key:
+        st.warning("Please provide your Gemini API key in Secrets or the input box.")
 
 if __name__ == "__main__":
     main()
