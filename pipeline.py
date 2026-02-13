@@ -5,7 +5,7 @@ import asyncio
 import time
 import logging
 import hashlib
-from typing import Any, Dict, Optional, List, Tuple, Generic, TypeVar
+from typing import Any, Dict, Optional, List, Tuple, Generic, TypeVar, Union
 
 from pypdf import PdfReader
 from PIL import Image
@@ -18,8 +18,6 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 # ==============================
 # 0) LOGGING CONFIGURATION
 # ==============================
-# DEV: logging.DEBUG  (shows more, but still PHI-safe)
-# PROD: logging.INFO  (minimal)
 LOG_LEVEL = logging.DEBUG
 
 logging.basicConfig(
@@ -32,7 +30,8 @@ logger = logging.getLogger(__name__)
 # ==============================
 # 1) SECURITY
 # ==============================
-API_KEY = "AIzaSyAgbfrTiVk7x-_EJl0yiHeDGAJ7Fx4NS4M"
+# ✅ DO NOT hardcode keys in source code (especially if repo is public)
+API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 # ==============================
 # 2) CONFIGURATION
@@ -171,6 +170,49 @@ class PatientInfo(BaseModel):
     surname: Optional[EvidenceField[str]] = None
 
 
+# ------------------------------
+# Helper coercion (CRITICAL FIX)
+# ------------------------------
+def _digits_to_int(x: Any) -> Optional[int]:
+    if x is None:
+        return None
+    if isinstance(x, int):
+        return x
+    if isinstance(x, float):
+        return int(x)
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return None
+        digits = "".join(ch for ch in s if ch.isdigit())
+        return int(digits) if digits else None
+    return None
+
+
+def coerce_evidence_int(v: Any) -> Optional[Dict[str, Any]]:
+    """
+    Accepts:
+      - "153"
+      - 153
+      - {"value": "153", "evidence": [...]}
+    Returns EvidenceField[int] dict or None.
+    """
+    if v is None:
+        return None
+
+    if isinstance(v, dict):
+        # Already evidence-ish
+        val = _digits_to_int(v.get("value"))
+        ev = v.get("evidence") or []
+        if not isinstance(ev, list):
+            ev = [str(ev)]
+        return {"value": val, "evidence": [str(e) for e in ev if e is not None]}
+
+    # string/int/float -> wrap
+    val = _digits_to_int(v)
+    return {"value": val, "evidence": []}
+
+
 class Vitals(BaseModel):
     bp_systolic: Optional[EvidenceField[int]] = None
     bp_diastolic: Optional[EvidenceField[int]] = None
@@ -178,50 +220,50 @@ class Vitals(BaseModel):
     ecg_rate: Optional[EvidenceField[int]] = None
     spo2: Optional[EvidenceField[int]] = None
 
-    # This validator ensures strings like "153 mmHg" become the integer 153
+    # ✅ accept str/int/dict and coerce BEFORE EvidenceField parsing
     @field_validator("bp_systolic", "bp_diastolic", "pulse_rate", "ecg_rate", "spo2", mode="before")
     @classmethod
     def clean_numeric(cls, v):
-        if isinstance(v, dict) and "value" in v:
-            val = str(v.get("value") or "")
-            digits = "".join(ch for ch in val if ch.isdigit())
-            v["value"] = int(digits) if digits else None
-        return v
+        return coerce_evidence_int(v)
 
     @field_validator("spo2")
     @classmethod
     def validate_spo2(cls, v):
-        if isinstance(v, dict) and v.get("value") is not None:
-            if not (0 <= v["value"] <= 100):
-                v["value"] = None
-                v["evidence"] = []
+        if isinstance(v, EvidenceField):
+            val = v.value
+            if val is not None and not (0 <= val <= 100):
+                v.value = None
+                v.evidence = []
         return v
 
     @field_validator("pulse_rate", "ecg_rate")
     @classmethod
     def validate_rates(cls, v):
-        if isinstance(v, dict) and v.get("value") is not None:
-            if not (20 <= v["value"] <= 250):
-                v["value"] = None
-                v["evidence"] = []
+        if isinstance(v, EvidenceField):
+            val = v.value
+            if val is not None and not (20 <= val <= 250):
+                v.value = None
+                v.evidence = []
         return v
 
     @field_validator("bp_systolic")
     @classmethod
     def validate_sys(cls, v):
-        if isinstance(v, dict) and v.get("value") is not None:
-            if not (60 <= v["value"] <= 260):
-                v["value"] = None
-                v["evidence"] = []
+        if isinstance(v, EvidenceField):
+            val = v.value
+            if val is not None and not (60 <= val <= 260):
+                v.value = None
+                v.evidence = []
         return v
 
     @field_validator("bp_diastolic")
     @classmethod
     def validate_dia(cls, v):
-        if isinstance(v, dict) and v.get("value") is not None:
-            if not (30 <= v["value"] <= 180):
-                v["value"] = None
-                v["evidence"] = []
+        if isinstance(v, EvidenceField):
+            val = v.value
+            if val is not None and not (30 <= val <= 180):
+                v.value = None
+                v.evidence = []
         return v
 
 
@@ -234,13 +276,12 @@ class Notes(BaseModel):
 
 
 class MedicationItem(BaseModel):
-    # Matches the updated prompt schema
     name: EvidenceField[str] = Field(default_factory=EvidenceField)
     dose: EvidenceField[str] = Field(default_factory=EvidenceField)
     route: EvidenceField[str] = Field(default_factory=EvidenceField)
 
+
 class ClinicalImpressionItem(BaseModel):
-    # Fixed nesting: use 'impression' instead of 'value'
     impression: EvidenceField[str] = Field(default_factory=EvidenceField)
 
 
@@ -327,7 +368,6 @@ async def generate_phase1_json_text_async(
     if file_path.lower().endswith(".pdf"):
         pdf_text_tmp, quality = await asyncio.to_thread(extract_pdf_text_layer, file_path)
 
-        # DEBUG ONLY (no PHI)
         logger.debug(f"[Router] quality={quality:.2f} chars={len(pdf_text_tmp)}")
 
         if quality >= 0.70 and len(pdf_text_tmp) >= 800:
@@ -345,7 +385,6 @@ async def generate_phase1_json_text_async(
 
     for m in models:
         try:
-            # INFO safe (no filename)
             logger.info(f"🚀 Phase 1 extraction ({mode}) using {m}")
 
             resp = await client.aio.models.generate_content(
@@ -365,13 +404,13 @@ async def generate_phase1_json_text_async(
 
 
 # ==============================
-# 9) POST-CLEANUP
+# 9) POST-CLEANUP / NORMALIZATION
 # ==============================
 def beautify_phase1(obj: Dict[str, Any]) -> Dict[str, Any]:
     obj = dict(obj)
     vitals = obj.get("vitals") or {}
 
-    # Explicitly initialize all fields to prevent 'KeyError' or missing keys
+    # Ensure all vital keys exist
     required_vitals = ["bp_systolic", "bp_diastolic", "pulse_rate", "ecg_rate", "spo2"]
     for v in required_vitals:
         vitals.setdefault(v, {"value": None, "evidence": []})
@@ -381,25 +420,49 @@ def beautify_phase1(obj: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def normalize_schema(p1: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    ✅ Fixes:
+      - clinical_impression must ALWAYS be a list of {"impression": {"value":..., "evidence":[...]}}
+      - vitals fields might be strings -> wrap into evidence dict so Pydantic accepts
+    """
     out = dict(p1)
 
-    # Ensure clinical_impression is always a list of correctly formatted objects
-    cis = out.get("clinical_impression") or []
-    normalized_cis = []
+    # ---- vitals shape fix (string/int -> dict) ----
+    vitals = out.get("vitals") or {}
+    for k in ["bp_systolic", "bp_diastolic", "pulse_rate", "ecg_rate", "spo2"]:
+        vitals[k] = coerce_evidence_int(vitals.get(k))
+        if vitals[k] is None:
+            vitals[k] = {"value": None, "evidence": []}
+    out["vitals"] = vitals
+
+    # ---- clinical_impression shape fix ----
+    cis = out.get("clinical_impression")
+
+    normalized_cis: List[Dict[str, Any]] = []
+
+    # If Gemini returned a dict (your error case) -> convert to list
+    if isinstance(cis, dict):
+        # try common patterns: {"impression": {...}} or {"items":[...]} or {"0":...}
+        if "impression" in cis:
+            normalized_cis.append(cis)
+        elif "items" in cis and isinstance(cis["items"], list):
+            cis = cis["items"]
+        else:
+            cis = []
 
     if isinstance(cis, list):
         for item in cis:
-            if isinstance(item, dict) and "impression" in item:
-                # If it already matches {"impression": {"value": ...}}
+            if isinstance(item, dict) and "impression" in item and isinstance(item["impression"], dict):
                 normalized_cis.append(item)
+            elif isinstance(item, dict) and "value" in item:
+                # sometimes returns {"value":"...", "evidence":[...]} directly
+                normalized_cis.append({"impression": item})
             elif isinstance(item, str):
-                # Fallback if the AI returns a simple string
-                normalized_cis.append({
-                    "impression": {"value": item, "evidence": []}
-                })
+                normalized_cis.append({"impression": {"value": item, "evidence": []}})
 
     out["clinical_impression"] = normalized_cis
     return out
+
 
 def drop_impression_headers(p1: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(p1)
@@ -412,11 +475,11 @@ def drop_impression_headers(p1: Dict[str, Any]) -> Dict[str, Any]:
     out["clinical_impression"] = cleaned
     return out
 
+
 def apply_phase1_5_normalization(p1: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(p1)
     normalization = {"tier_a_expansions": [], "normalized_fields": {}}
 
-    # notes
     try:
         notes = (out.get("notes") or {}).get("raw_text") or {}
         notes_val = notes.get("value")
@@ -432,7 +495,6 @@ def apply_phase1_5_normalization(p1: Dict[str, Any]) -> Dict[str, Any]:
 
     out["normalization"] = normalization
     return out
-
 
 
 # ==============================
@@ -469,14 +531,10 @@ IMPORTANT SAFETY RULES (MANDATORY):
    - Do NOT code based on them unless the expanded meaning is explicitly written out.
 
 2. Do NOT infer qualifiers, severity, timing, or subtypes.
-   - Examples: "on exertion", "acute", "chronic", "with complication".
-   - These may ONLY be used if the exact wording appears in the text.
 
 3. Prefer conservative, unspecified symptom codes when documentation lacks specificity.
-   - Example: "chest discomfort" without further qualifiers → code as R07.4 (Chest pain, unspecified).
 
 4. Code ONLY what is clearly and explicitly documented.
-   - If documentation is vague or ambiguous, do NOT code it.
 
 5. If a condition is suspected, ruled out, or not confirmed,
    code the presenting symptom — NOT the suspected diagnosis.
@@ -484,14 +542,6 @@ IMPORTANT SAFETY RULES (MANDATORY):
 ---
 PATIENT DATA (JSON):
 {patient_data_json}
-
----
-INSTRUCTIONS:
-
-1. Identify clinical findings, symptoms, and impressions exactly as written.
-2. Apply ONLY the SAFE abbreviation guide above.
-3. Assign the most accurate ICD-10-CM code supported by explicit text.
-4. Do NOT add, infer, or refine beyond documentation.
 
 ---
 REQUIRED OUTPUT FORMAT (JSON ONLY):
@@ -514,11 +564,7 @@ async def run_phase2_coding_async(
     models: List[str],
     phase1_data: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    """
-    Runs ICD-10 coding using the SAME client/models as Phase 1.
-    Returns parsed JSON dict or None.
-    """
-    # Keep your logic: dump JSON into prompt
+
     data_str = json.dumps(phase1_data, indent=2, ensure_ascii=False)
     prompt = PHASE2_PROMPT_TEMPLATE.format(patient_data_json=data_str)
 
@@ -535,7 +581,6 @@ async def run_phase2_coding_async(
                     temperature=0.0,
                 ),
             )
-            # resp.text should be JSON due to response_mime_type
             return json.loads(resp.text)
 
         except Exception as e:
@@ -544,9 +589,6 @@ async def run_phase2_coding_async(
 
     logger.error(f"❌ Phase 2 failed. Last error: {type(last_err).__name__ if last_err else 'Unknown'}")
     return None
-
-
-
 
 
 # ==============================
@@ -581,23 +623,20 @@ async def process_single_file(
 
             validated = MedicalReport(**p1)
 
-            # DEBUG only, still PHI safe (no patient_info)
             logger.debug(f"{job_id}: validated successfully")
 
             phase1_out = validated.model_dump(exclude_none=True)
 
-            # --- Phase 2: ICD-10 coding ---
+            # --- Phase 2 ---
             phase2_out = await run_phase2_coding_async(client, models, phase1_out)
 
             if phase2_out:
-                # attach results without changing Phase 1 structure
                 phase1_out["icd10_coding"] = phase2_out.get("coding_results", [])
-                phase1_out["icd10_coding_raw"] = phase2_out  # optional but useful
+                phase1_out["icd10_coding_raw"] = phase2_out
 
             return phase1_out
 
         except ValidationError as e:
-            # PHI safe: only show error locations/messages
             safe_errors = [(err.get("loc"), err.get("msg")) for err in e.errors()]
             logger.error(f"{job_id}: validation error {safe_errors}")
             return None
@@ -611,6 +650,10 @@ async def process_single_file(
 # 11) BATCH RUNNER
 # ==============================
 async def run_batch_job(file_paths: List[str]) -> List[Dict[str, Any]]:
+    if not API_KEY:
+        logger.critical("GEMINI_API_KEY is missing. Set it as an environment variable.")
+        return []
+
     client = get_client()
     models = choose_model(client, DEFAULT_MODEL_CANDIDATES)
     sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
@@ -638,8 +681,8 @@ async def run_batch_job(file_paths: List[str]) -> List[Dict[str, Any]]:
 if __name__ == "__main__":
     test_file_path = r"C:\Users\rieta\OneDrive\Desktop\medical_ocr\WWD2YWN-A-U49.pdf"
 
-    if "PASTE_YOUR_KEY_HERE" in API_KEY:
-        logger.critical("API Key is missing!")
+    if not API_KEY:
+        logger.critical("API Key is missing! Set GEMINI_API_KEY env var.")
     elif not os.path.exists(test_file_path):
         logger.critical("Test file not found.")
     else:
@@ -653,5 +696,3 @@ if __name__ == "__main__":
                 json.dump(final_data, f, indent=2, ensure_ascii=False)
 
             logger.info(f"Results saved to disk: {output_name}")
-
-
